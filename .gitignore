@@ -8,6 +8,10 @@ dist/
 store/
 data/
 logs/
+*.db
+.last-synced-token-hash
+.token-sync-heartbeat
+dashboard.html
 
 # Groups - only track base structure and specific CLAUDE.md files
 groups/*
