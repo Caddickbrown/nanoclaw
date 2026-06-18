@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
@@ -27,6 +28,7 @@ interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  taskId?: string;
 }
 
 interface ContainerOutput {
@@ -56,7 +58,24 @@ interface SDKUserMessage {
 
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
-const IPC_POLL_MS = 500;
+const IPC_FALLBACK_POLL_MS = 5000;
+const SUBAGENT_WAIT_MAX_MS = 7_200_000; // 2 hours
+
+function hasActiveSubagents(): boolean {
+  try {
+    // Sub-agents (Agent Teams) appear as additional `claude` processes spawned by the
+    // main claude SDK process. The main query always has exactly 1 claude child;
+    // MCP servers (node/npx) are not sub-agents. Only wait if there are >1 claude processes.
+    const out = execSync(`ps -e -o comm= 2>/dev/null`, {
+      timeout: 2000,
+      encoding: 'utf8',
+    });
+    const claudeCount = out.split('\n').filter(line => line.trim() === 'claude').length;
+    return claudeCount > 1;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -304,22 +323,69 @@ function drainIpcInput(): string[] {
 /**
  * Wait for a new IPC message or _close sentinel.
  * Returns the messages as a single string, or null if _close.
+ * Uses fs.watch for near-instant detection, with a fallback interval.
  */
 function waitForIpcMessage(): Promise<string | null> {
   return new Promise((resolve) => {
-    const poll = () => {
+    let settled = false;
+    let watcher: fs.FSWatcher | null = null;
+    let fallbackTimer: ReturnType<typeof setInterval> | null = null;
+    let subagentWaitStart: number | null = null;
+
+    const cleanup = () => {
+      if (watcher) { try { watcher.close(); } catch { /* ignore */ } watcher = null; }
+      if (fallbackTimer) { clearInterval(fallbackTimer); fallbackTimer = null; }
+    };
+
+    const check = () => {
+      if (settled) return;
+
       if (shouldClose()) {
+        if (hasActiveSubagents()) {
+          if (subagentWaitStart === null) {
+            subagentWaitStart = Date.now();
+            log('Close sentinel received but sub-agents are active, waiting for them to finish...');
+          } else if (Date.now() - subagentWaitStart >= SUBAGENT_WAIT_MAX_MS) {
+            log('Warning: sub-agent wait cap (2h) reached, proceeding with close');
+            settled = true;
+            cleanup();
+            resolve(null);
+            return;
+          }
+          // Reschedule and wait
+          setTimeout(check, 2000);
+          return;
+        }
+        settled = true;
+        cleanup();
         resolve(null);
         return;
       }
+
       const messages = drainIpcInput();
       if (messages.length > 0) {
+        settled = true;
+        cleanup();
         resolve(messages.join('\n'));
         return;
       }
-      setTimeout(poll, IPC_POLL_MS);
     };
-    poll();
+
+    // Set up fs.watch for instant notification
+    fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
+    try {
+      watcher = fs.watch(IPC_INPUT_DIR, (_eventType, _filename) => {
+        check();
+      });
+    } catch (err) {
+      log(`fs.watch failed, falling back to poll only: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Fallback interval in case inotify misses events
+    fallbackTimer = setInterval(check, IPC_FALLBACK_POLL_MS);
+
+    // Run an initial check immediately
+    check();
   });
 }
 
@@ -340,26 +406,69 @@ async function runQuery(
   const stream = new MessageStream();
   stream.push(prompt);
 
-  // Poll IPC for follow-up messages and _close sentinel during the query
+  // Watch IPC input dir for follow-up messages and _close sentinel during the query.
+  // fs.watch provides near-instant detection; a fallback interval catches any missed events.
   let ipcPolling = true;
   let closedDuringQuery = false;
-  const pollIpcDuringQuery = () => {
+  let subagentWaitStart: number | null = null;
+  let queryWatcher: fs.FSWatcher | null = null;
+  let queryFallbackTimer: ReturnType<typeof setInterval> | null = null;
+
+  const drainAndCheckClose = () => {
     if (!ipcPolling) return;
+
     if (shouldClose()) {
+      if (hasActiveSubagents()) {
+        if (subagentWaitStart === null) {
+          subagentWaitStart = Date.now();
+          log('Close sentinel detected during query, but sub-agents are active — waiting...');
+        } else if (Date.now() - subagentWaitStart >= SUBAGENT_WAIT_MAX_MS) {
+          log('Warning: sub-agent wait cap (2h) reached during query, proceeding with close');
+          closedDuringQuery = true;
+          stream.end();
+          ipcPolling = false;
+          if (queryWatcher) { try { queryWatcher.close(); } catch { /* ignore */ } queryWatcher = null; }
+          if (queryFallbackTimer) { clearInterval(queryFallbackTimer); queryFallbackTimer = null; }
+          return;
+        }
+        // Reschedule and wait
+        setTimeout(drainAndCheckClose, 2000);
+        return;
+      }
       log('Close sentinel detected during query, ending stream');
       closedDuringQuery = true;
       stream.end();
       ipcPolling = false;
+      if (queryWatcher) { try { queryWatcher.close(); } catch { /* ignore */ } queryWatcher = null; }
+      if (queryFallbackTimer) { clearInterval(queryFallbackTimer); queryFallbackTimer = null; }
       return;
     }
+
     const messages = drainIpcInput();
     for (const text of messages) {
       log(`Piping IPC message into active query (${text.length} chars)`);
       stream.push(text);
     }
-    setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
   };
-  setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
+
+  // Set up fs.watch on IPC_INPUT_DIR for instant file-creation events
+  fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
+  try {
+    queryWatcher = fs.watch(IPC_INPUT_DIR, (_eventType, _filename) => {
+      drainAndCheckClose();
+    });
+  } catch (err) {
+    log(`fs.watch failed during query, using fallback poll only: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Fallback interval in case inotify misses events
+  queryFallbackTimer = setInterval(() => {
+    if (!ipcPolling) {
+      if (queryFallbackTimer) { clearInterval(queryFallbackTimer); queryFallbackTimer = null; }
+      return;
+    }
+    drainAndCheckClose();
+  }, IPC_FALLBACK_POLL_MS);
 
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
@@ -367,9 +476,11 @@ async function runQuery(
   let resultCount = 0;
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
-  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
+  const globalClaudeMdPath = containerInput.isMain
+    ? '/workspace/project/groups/global/CLAUDE.md'
+    : '/workspace/global/CLAUDE.md';
   let globalClaudeMd: string | undefined;
-  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
+  if (fs.existsSync(globalClaudeMdPath)) {
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
 
@@ -422,6 +533,7 @@ async function runQuery(
             NANOCLAW_CHAT_JID: containerInput.chatJid,
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+            NANOCLAW_TASK_ID: containerInput.taskId || '',
           },
         },
         gmail: {
@@ -465,6 +577,8 @@ async function runQuery(
   }
 
   ipcPolling = false;
+  if (queryWatcher) { try { queryWatcher.close(); } catch { /* ignore */ } queryWatcher = null; }
+  if (queryFallbackTimer) { clearInterval(queryFallbackTimer); queryFallbackTimer = null; }
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }

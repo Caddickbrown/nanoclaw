@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# pdf-reader — extract text from a PDF file or URL
+# Usage:
+#   pdf-reader <path>          Extract text from a local PDF file
+#   pdf-reader fetch <url>     Download a PDF from a URL then extract text
+#   pdf-reader info <path>     Show PDF metadata (page count, title, author…)
+set -euo pipefail
+
+cmd="${1:-}"
+if [[ -z "$cmd" ]]; then
+  echo "Usage: pdf-reader <path> | pdf-reader fetch <url> | pdf-reader info <path>" >&2
+  exit 1
+fi
+
+extract() {
+  local file="$1"
+  if ! command -v pdftotext &>/dev/null; then
+    echo "Error: pdftotext not found. Install poppler-utils." >&2
+    exit 1
+  fi
+  pdftotext -layout "$file" -
+}
+
+info() {
+  local file="$1"
+  pdfinfo "$file"
+}
+
+case "$cmd" in
+  fetch)
+    url="${2:-}"
+    if [[ -z "$url" ]]; then
+      echo "Usage: pdf-reader fetch <url>" >&2; exit 1
+    fi
+    tmpfile=$(mktemp /tmp/pdf-reader-XXXXXX.pdf)
+    trap 'rm -f "$tmpfile"' EXIT
+    curl -fsSL --max-filesize 52428800 -o "$tmpfile" "$url"
+    extract "$tmpfile"
+    ;;
+  info)
+    path="${2:-}"
+    if [[ -z "$path" ]]; then
+      echo "Usage: pdf-reader info <path>" >&2; exit 1
+    fi
+    info "$path"
+    ;;
+  *)
+    # First arg is a file path
+    extract "$cmd"
+    ;;
+esac

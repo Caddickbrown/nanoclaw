@@ -14,8 +14,47 @@ import { createServer, Server } from 'http';
 import { request as httpsRequest } from 'https';
 import { request as httpRequest, RequestOptions } from 'http';
 
+import { readFileSync } from 'fs';
+import { homedir } from 'os';
+import path from 'path';
+
+import { logUsage, setRouterState } from './db.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
+import { hasOAuthCredentials } from './oauth-refresh.js';
+
+function captureRateLimitHeaders(
+  headers: Record<string, string | string[] | undefined>,
+): void {
+  const data: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.startsWith('anthropic-ratelimit-') && typeof value === 'string') {
+      data[key] = value;
+    }
+  }
+  if (Object.keys(data).length > 0) {
+    try {
+      setRouterState(
+        'rate_limits',
+        JSON.stringify({ captured_at: new Date().toISOString(), ...data }),
+      );
+    } catch { /* never break the proxy */ }
+  }
+}
+
+function readOAuthToken(): string | null {
+  try {
+    const creds = JSON.parse(
+      readFileSync(
+        path.join(homedir(), '.claude', '.credentials.json'),
+        'utf8',
+      ),
+    );
+    return creds?.claudeAiOauth?.accessToken ?? null;
+  } catch {
+    return null;
+  }
+}
 
 export type AuthMode = 'api-key' | 'oauth';
 
@@ -29,14 +68,18 @@ export function startCredentialProxy(
 ): Promise<Server> {
   const secrets = readEnvFile([
     'ANTHROPIC_API_KEY',
-    'CLAUDE_CODE_OAUTH_TOKEN',
-    'ANTHROPIC_AUTH_TOKEN',
     'ANTHROPIC_BASE_URL',
+    'AUTH_MODE',
   ]);
 
-  const authMode: AuthMode = secrets.ANTHROPIC_API_KEY ? 'api-key' : 'oauth';
-  const oauthToken =
-    secrets.CLAUDE_CODE_OAUTH_TOKEN || secrets.ANTHROPIC_AUTH_TOKEN;
+  const authMode: AuthMode =
+    secrets.AUTH_MODE === 'oauth'
+      ? 'oauth'
+      : secrets.AUTH_MODE === 'api-key'
+        ? 'api-key'
+        : secrets.ANTHROPIC_API_KEY
+          ? 'api-key'
+          : 'oauth';
 
   const upstreamUrl = new URL(
     secrets.ANTHROPIC_BASE_URL || 'https://api.anthropic.com',
@@ -48,7 +91,7 @@ export function startCredentialProxy(
     const server = createServer((req, res) => {
       const chunks: Buffer[] = [];
       req.on('data', (c) => chunks.push(c));
-      req.on('end', () => {
+      req.on('end', async () => {
         const body = Buffer.concat(chunks);
         const headers: Record<string, string | number | string[] | undefined> =
           {
@@ -73,11 +116,16 @@ export function startCredentialProxy(
           // x-api-key only, so they pass through without token injection.
           if (headers['authorization']) {
             delete headers['authorization'];
+            // Read token from credentials file — kept fresh by system 2 (systemd timers)
+            const oauthToken = readOAuthToken();
             if (oauthToken) {
               headers['authorization'] = `Bearer ${oauthToken}`;
             }
           }
         }
+
+        const isMessageRequest =
+          req.method === 'POST' && req.url === '/v1/messages';
 
         const upstream = makeRequest(
           {
@@ -88,8 +136,78 @@ export function startCredentialProxy(
             headers,
           } as RequestOptions,
           (upRes) => {
+            captureRateLimitHeaders(
+              upRes.headers as Record<string, string | string[] | undefined>,
+            );
             res.writeHead(upRes.statusCode!, upRes.headers);
-            upRes.pipe(res);
+
+            if (!isMessageRequest || upRes.statusCode !== 200) {
+              upRes.pipe(res);
+              return;
+            }
+
+            const contentType = upRes.headers['content-type'] || '';
+            const isSSE = contentType.includes('text/event-stream');
+
+            if (isSSE) {
+              let sseBuffer = '';
+              let model = '';
+              let inputTokens = 0;
+              let outputTokens = 0;
+
+              upRes.on('data', (chunk: Buffer) => {
+                res.write(chunk);
+                sseBuffer += chunk.toString();
+                let idx: number;
+                while ((idx = sseBuffer.indexOf('\n\n')) !== -1) {
+                  const event = sseBuffer.slice(0, idx);
+                  sseBuffer = sseBuffer.slice(idx + 2);
+                  const match = event.match(/^data: (.+)$/m);
+                  if (!match || match[1] === '[DONE]') continue;
+                  try {
+                    const data = JSON.parse(match[1]);
+                    if (data.type === 'message_start' && data.message) {
+                      if (data.message.model) model = data.message.model;
+                      inputTokens += data.message.usage?.input_tokens || 0;
+                    } else if (data.type === 'message_delta' && data.usage) {
+                      outputTokens = data.usage.output_tokens || outputTokens;
+                    }
+                  } catch { /* ignore parse errors */ }
+                }
+              });
+
+              upRes.on('end', () => {
+                res.end();
+                if (model && (inputTokens || outputTokens)) {
+                  logUsage({
+                    timestamp: new Date().toISOString(),
+                    model,
+                    input_tokens: inputTokens,
+                    output_tokens: outputTokens,
+                    is_streaming: true,
+                  });
+                }
+              });
+            } else {
+              const chunks: Buffer[] = [];
+              upRes.on('data', (c: Buffer) => chunks.push(c));
+              upRes.on('end', () => {
+                const body = Buffer.concat(chunks);
+                res.end(body);
+                try {
+                  const data = JSON.parse(body.toString());
+                  if (data.model && data.usage) {
+                    logUsage({
+                      timestamp: new Date().toISOString(),
+                      model: data.model,
+                      input_tokens: data.usage.input_tokens || 0,
+                      output_tokens: data.usage.output_tokens || 0,
+                      is_streaming: false,
+                    });
+                  }
+                } catch { /* ignore parse errors */ }
+              });
+            }
           },
         );
 
@@ -120,6 +238,9 @@ export function startCredentialProxy(
 
 /** Detect which auth mode the host is configured for. */
 export function detectAuthMode(): AuthMode {
-  const secrets = readEnvFile(['ANTHROPIC_API_KEY']);
-  return secrets.ANTHROPIC_API_KEY ? 'api-key' : 'oauth';
+  const secrets = readEnvFile(['ANTHROPIC_API_KEY', 'AUTH_MODE']);
+  if (secrets.AUTH_MODE === 'oauth') return 'oauth';
+  if (secrets.AUTH_MODE === 'api-key') return 'api-key';
+  if (secrets.ANTHROPIC_API_KEY) return 'api-key';
+  return hasOAuthCredentials() ? 'oauth' : 'oauth';
 }

@@ -3,16 +3,38 @@ import path from 'path';
 
 import { CronExpressionParser } from 'cron-parser';
 
-import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
+import { DATA_DIR, TIMEZONE } from './config.js';
 import { sendPoolMessage } from './channels/telegram.js';
 import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import {
+  addGoalProgress,
+  createGoal,
+  createTask,
+  deleteTask,
+  getGoalById,
+  getGoalByTitle,
+  getTaskById,
+  updateGoal,
+  updateTask,
+} from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import { Goal, RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendFile: (jid: string, filePath: string, caption?: string) => Promise<void>;
+  sendReaction: (
+    jid: string,
+    messageId: string,
+    emoji: string,
+  ) => Promise<void>;
+  sendMessageWithButtons: (
+    jid: string,
+    text: string,
+    buttons: Array<{label: string, value: string}>,
+    checkinId: string,
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -26,6 +48,93 @@ export interface IpcDeps {
 }
 
 let ipcWatcherRunning = false;
+let lastErrorCleanup = 0;
+const ERROR_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const ERROR_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+// inotify-based watchers: key is the watched directory path
+const ipcWatchers = new Map<string, fs.FSWatcher>();
+
+// Debounce flag: prevents queuing multiple processIpcFiles calls
+let processPending = false;
+// Concurrency guard: prevents processIpcFiles from running twice simultaneously.
+// inotify events and the 5s fallback poll can both fire around the same time;
+// without this, both would read the same IPC file before either deletes it, causing
+// the same message to be sent multiple times.
+let isProcessing = false;
+let runAgainAfter = false;
+
+function triggerProcess(processIpcFiles: () => void): void {
+  if (processPending) return;
+  processPending = true;
+  setImmediate(() => {
+    processPending = false;
+    processIpcFiles();
+  });
+}
+
+function watchGroupIpcDirs(
+  groupFolder: string,
+  ipcBaseDir: string,
+  processIpcFiles: () => void,
+): void {
+  const dirsToWatch = [
+    path.join(ipcBaseDir, groupFolder, 'messages'),
+    path.join(ipcBaseDir, groupFolder, 'tasks'),
+  ];
+
+  for (const dir of dirsToWatch) {
+    if (ipcWatchers.has(dir)) continue; // already watching
+    if (!fs.existsSync(dir)) continue;  // dir not yet created
+
+    try {
+      const watcher = fs.watch(dir, (eventType) => {
+        // On Linux, 'rename' fires on file creation and deletion
+        if (eventType === 'rename') {
+          triggerProcess(processIpcFiles);
+        }
+      });
+
+      watcher.on('error', (err) => {
+        logger.warn({ dir, err }, 'IPC fs.watch error — removing watcher');
+        ipcWatchers.delete(dir);
+        watcher.close();
+      });
+
+      ipcWatchers.set(dir, watcher);
+      logger.debug({ dir }, 'IPC fs.watch started');
+    } catch (err) {
+      logger.warn({ dir, err }, 'Failed to start fs.watch on IPC dir');
+    }
+  }
+}
+
+function cleanupOldErrorFiles(ipcBaseDir: string): void {
+  const now = Date.now();
+  if (now - lastErrorCleanup < ERROR_CLEANUP_INTERVAL_MS) return;
+  lastErrorCleanup = now;
+
+  const errorDir = path.join(ipcBaseDir, 'errors');
+  if (!fs.existsSync(errorDir)) return;
+
+  try {
+    const files = fs.readdirSync(errorDir);
+    for (const file of files) {
+      const filePath = path.join(errorDir, file);
+      try {
+        const stat = fs.statSync(filePath);
+        if (now - stat.mtimeMs > ERROR_MAX_AGE_MS) {
+          fs.unlinkSync(filePath);
+          logger.info({ file }, 'Deleted old IPC error file');
+        }
+      } catch (err) {
+        logger.warn({ file, err }, 'Failed to stat/delete IPC error file');
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Failed to read IPC errors directory during cleanup');
+  }
+}
 
 export function startIpcWatcher(deps: IpcDeps): void {
   if (ipcWatcherRunning) {
@@ -38,6 +147,25 @@ export function startIpcWatcher(deps: IpcDeps): void {
   fs.mkdirSync(ipcBaseDir, { recursive: true });
 
   const processIpcFiles = async () => {
+    if (isProcessing) {
+      runAgainAfter = true;
+      return;
+    }
+    isProcessing = true;
+    try {
+      await processIpcFilesInner();
+    } finally {
+      isProcessing = false;
+      if (runAgainAfter) {
+        runAgainAfter = false;
+        setImmediate(processIpcFiles);
+      }
+    }
+  };
+
+  const processIpcFilesInner = async () => {
+    cleanupOldErrorFiles(ipcBaseDir);
+
     // Scan all group IPC directories (identity determined by directory)
     let groupFolders: string[];
     try {
@@ -47,7 +175,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
       });
     } catch (err) {
       logger.error({ err }, 'Error reading IPC base directory');
-      setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
+      setTimeout(processIpcFiles, 5000);
       return;
     }
 
@@ -55,11 +183,20 @@ export function startIpcWatcher(deps: IpcDeps): void {
 
     // Build folder→isMain lookup from registered groups
     const folderIsMain = new Map<string, boolean>();
+    const knownFolders = new Set<string>();
     for (const group of Object.values(registeredGroups)) {
+      knownFolders.add(group.folder);
       if (group.isMain) folderIsMain.set(group.folder, true);
     }
 
     for (const sourceGroup of groupFolders) {
+      // Only process directories that correspond to a known registered group folder
+      if (!knownFolders.has(sourceGroup)) {
+        logger.warn({ sourceGroup }, 'IPC: skipping unknown group folder');
+        continue;
+      }
+      // Ensure inotify watchers are active for this group's IPC subdirs
+      watchGroupIpcDirs(sourceGroup, ipcBaseDir, processIpcFiles);
       const isMain = folderIsMain.get(sourceGroup) === true;
       const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
       const tasksDir = path.join(ipcBaseDir, sourceGroup, 'tasks');
@@ -99,6 +236,107 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
+                  );
+                }
+              } else if (
+                data.type === 'reaction' &&
+                data.chatJid &&
+                data.messageId &&
+                data.emoji
+              ) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  await deps.sendReaction(
+                    data.chatJid,
+                    data.messageId,
+                    data.emoji,
+                  );
+                  logger.info(
+                    {
+                      chatJid: data.chatJid,
+                      messageId: data.messageId,
+                      emoji: data.emoji,
+                    },
+                    'IPC reaction sent',
+                  );
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC reaction attempt blocked',
+                  );
+                }
+              } else if (
+                (data.type === 'file' || data.type === 'voice') &&
+                data.chatJid &&
+                data.filePath
+              ) {
+                // Resolve file path relative to this group's IPC dir and validate
+                const groupIpcDir = path.join(ipcBaseDir, sourceGroup);
+                const resolvedPath = path.resolve(groupIpcDir, data.filePath);
+                if (!resolvedPath.startsWith(groupIpcDir + path.sep)) {
+                  logger.warn(
+                    {
+                      chatJid: data.chatJid,
+                      sourceGroup,
+                      filePath: data.filePath,
+                    },
+                    'Blocked IPC file send: path escapes group IPC dir',
+                  );
+                } else {
+                  const targetGroup = registeredGroups[data.chatJid];
+                  if (
+                    isMain ||
+                    (targetGroup && targetGroup.folder === sourceGroup)
+                  ) {
+                    await deps.sendFile(
+                      data.chatJid,
+                      resolvedPath,
+                      data.caption,
+                    );
+                    logger.info(
+                      {
+                        chatJid: data.chatJid,
+                        sourceGroup,
+                        filePath: resolvedPath,
+                      },
+                      'IPC file sent',
+                    );
+                  } else {
+                    logger.warn(
+                      { chatJid: data.chatJid, sourceGroup },
+                      'Unauthorized IPC file send attempt blocked',
+                    );
+                  }
+                }
+              } else if (
+                data.type === 'message_with_buttons' &&
+                data.chatJid &&
+                data.text &&
+                Array.isArray(data.buttons) &&
+                data.checkinId
+              ) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  await deps.sendMessageWithButtons(
+                    data.chatJid,
+                    data.text,
+                    data.buttons as Array<{label: string, value: string}>,
+                    data.checkinId,
+                  );
+                  logger.info(
+                    { chatJid: data.chatJid, checkinId: data.checkinId, sourceGroup },
+                    'IPC checkin message sent',
+                  );
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC checkin attempt blocked',
                   );
                 }
               }
@@ -156,11 +394,26 @@ export function startIpcWatcher(deps: IpcDeps): void {
       }
     }
 
-    setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
+    // Fallback poll every 5 seconds — catches any events inotify may have missed
+    setTimeout(processIpcFiles, 5000);
   };
 
   processIpcFiles();
-  logger.info('IPC watcher started (per-group namespaces)');
+  logger.info('IPC watcher started (per-group namespaces, inotify + 5s fallback poll)');
+}
+
+export function stopIpcWatcher(): void {
+  for (const [dir, watcher] of ipcWatchers) {
+    try {
+      watcher.close();
+      logger.debug({ dir }, 'IPC fs.watch closed');
+    } catch (err) {
+      logger.warn({ dir, err }, 'Error closing IPC fs.watch');
+    }
+  }
+  ipcWatchers.clear();
+  ipcWatcherRunning = false;
+  logger.info('IPC watcher stopped');
 }
 
 export async function processTaskIpc(
@@ -181,6 +434,16 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For create_goal / update_goal
+    goalId?: string;
+    title?: string;
+    description?: string;
+    status?: string;
+    priority?: string;
+    target_date?: string;
+    progress_note?: string;
+    autonomy_level?: string;
+    action_context?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -456,6 +719,57 @@ export async function processTaskIpc(
           { data },
           'Invalid register_group request - missing required fields',
         );
+      }
+      break;
+
+    case 'create_goal':
+      if (data.title && data.description) {
+        const existingGoal = getGoalByTitle(data.title, sourceGroup);
+        if (existingGoal) {
+          logger.info(
+            { existingId: existingGoal.id, title: data.title },
+            'Skipping duplicate goal creation',
+          );
+          break;
+        }
+        const goalId = createGoal({
+          group_folder: sourceGroup,
+          title: data.title,
+          description: data.description,
+          status: (data.status as 'active') || 'active',
+          priority: (data.priority as 'medium') || 'medium',
+          target_date: data.target_date || null,
+          progress_notes: '[]',
+          autonomy_level: (data.autonomy_level as Goal['autonomy_level']) || 'suggest',
+          action_context: data.action_context || null,
+        });
+        logger.info({ goalId, sourceGroup }, 'Goal created via IPC');
+      }
+      break;
+
+    case 'update_goal':
+      if (data.goalId) {
+        const goal = getGoalById(data.goalId);
+        if (goal && (isMain || goal.group_folder === sourceGroup)) {
+          if (data.progress_note) {
+            addGoalProgress(data.goalId, data.progress_note);
+          }
+          const goalFields = {
+            ...(data.title !== undefined && { title: data.title }),
+            ...(data.description !== undefined && { description: data.description }),
+            ...(data.status !== undefined && { status: data.status as Goal['status'] }),
+            ...(data.priority !== undefined && { priority: data.priority as Goal['priority'] }),
+            ...(data.target_date !== undefined && { target_date: data.target_date }),
+            ...(data.autonomy_level !== undefined && { autonomy_level: data.autonomy_level as Goal['autonomy_level'] }),
+            ...(data.action_context !== undefined && { action_context: data.action_context }),
+          };
+          if (Object.keys(goalFields).length > 0) {
+            updateGoal(data.goalId, goalFields);
+          }
+          logger.info({ goalId: data.goalId, sourceGroup }, 'Goal updated via IPC');
+        } else {
+          logger.warn({ goalId: data.goalId, sourceGroup }, 'Unauthorized goal update attempt');
+        }
       }
       break;
 

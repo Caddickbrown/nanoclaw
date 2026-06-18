@@ -1,0 +1,90 @@
+#!/bin/bash
+# exa-search: Fast AI-powered web search with agent-browser fallback
+# Usage: exa-search "query" [--num N] [--type auto|fast|deep] [--highlights]
+
+QUERY=""
+NUM_RESULTS=5
+SEARCH_TYPE="auto"
+USE_HIGHLIGHTS=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --num)        NUM_RESULTS="$2"; shift 2 ;;
+    --type)       SEARCH_TYPE="$2"; shift 2 ;;
+    --highlights) USE_HIGHLIGHTS=true; shift ;;
+    *)            QUERY="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$QUERY" ]]; then
+  echo "Usage: exa-search \"query\" [--num N] [--type auto|fast|deep] [--highlights]" >&2
+  exit 1
+fi
+
+# --- Exa API path ---
+if [[ -n "${EXA_API_KEY:-}" ]]; then
+  if [[ "$USE_HIGHLIGHTS" == true ]]; then
+    CONTENTS_KEY="highlights"
+    CONTENTS_VAL='{"maxCharacters":4000}'
+  else
+    CONTENTS_KEY="text"
+    CONTENTS_VAL='{"maxCharacters":5000}'
+  fi
+
+  PAYLOAD=$(python3 -c "
+import json, sys
+payload = {
+    'query': sys.argv[1],
+    'numResults': int(sys.argv[2]),
+    'type': sys.argv[3],
+    'contents': {sys.argv[4]: json.loads(sys.argv[5])}
+}
+print(json.dumps(payload))
+" "$QUERY" "$NUM_RESULTS" "$SEARCH_TYPE" "$CONTENTS_KEY" "$CONTENTS_VAL")
+
+  RESPONSE=$(curl -s -w "\n%{http_code}" \
+    -X POST "https://api.exa.ai/search" \
+    -H "x-api-key: ${EXA_API_KEY}" \
+    -H "Content-Type: application/json" \
+    -d "$PAYLOAD")
+
+  HTTP_BODY=$(echo "$RESPONSE" | head -n -1)
+  HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+
+  if [[ "$HTTP_CODE" == "200" ]]; then
+    python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+for r in data.get('results', []):
+    title = r.get('title') or 'Untitled'
+    url = r.get('url', '')
+    text = r.get('text', '')
+    highlights = r.get('highlights', [])
+    content = text[:2000] if text else '\n'.join(highlights)
+    print(f'## {title}')
+    print(f'URL: {url}')
+    if content:
+        print(content)
+    print()
+" <<< "$HTTP_BODY"
+    exit 0
+  fi
+
+  ERROR=$(python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('error') or d.get('message') or 'unknown error')
+except:
+    print('parse error')
+" <<< "$HTTP_BODY" 2>/dev/null || echo "HTTP $HTTP_CODE")
+
+  echo "[exa-search] Exa API unavailable (HTTP $HTTP_CODE: $ERROR), falling back to browser search..." >&2
+fi
+
+# --- agent-browser fallback via DuckDuckGo ---
+echo "[exa-search] Using agent-browser fallback for: $QUERY" >&2
+ENCODED=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$QUERY")
+agent-browser open "https://html.duckduckgo.com/html/?q=${ENCODED}"
+agent-browser snapshot -c -d 3
+agent-browser close

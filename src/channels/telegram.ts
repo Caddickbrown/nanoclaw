@@ -1,9 +1,13 @@
+import fs from 'fs';
 import https from 'https';
-import { Api, Bot } from 'grammy';
+import os from 'os';
+import path from 'path';
+import { Api, Bot, InputFile } from 'grammy';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, TRIGGER_PATTERN, GROUPS_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
+import { transcribeAudioFile } from '../transcription.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
@@ -16,6 +20,29 @@ export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+}
+
+/**
+ * Download a file from Telegram's file servers to a local path.
+ */
+function downloadTelegramFile(
+  token: string,
+  filePath: string,
+  dest: string,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const url = `https://api.telegram.org/file/bot${token}/${filePath}`;
+    const out = fs.createWriteStream(dest);
+    https
+      .get(url, { agent: https.globalAgent }, (res) => {
+        res.pipe(out);
+        out.on('finish', () => out.close(() => resolve()));
+      })
+      .on('error', (err) => {
+        fs.unlink(dest, () => {});
+        reject(err);
+      });
+  });
 }
 
 /**
@@ -96,28 +123,56 @@ export async function sendPoolMessage(
     // Rename the bot to match the sender's role, then wait for Telegram to propagate
     try {
       await poolApis[idx].setMyName(sender);
-      await new Promise((r) => setTimeout(r, 2000));
-      logger.info({ sender, groupFolder, poolIndex: idx }, 'Assigned and renamed pool bot');
+      // Brief grace period for Telegram API propagation before sending
+      await new Promise((r) => setTimeout(r, 500));
+      logger.info(
+        { sender, groupFolder, poolIndex: idx },
+        'Assigned and renamed pool bot',
+      );
     } catch (err) {
-      logger.warn({ sender, err }, 'Failed to rename pool bot (sending anyway)');
+      logger.warn(
+        { sender, err },
+        'Failed to rename pool bot (sending anyway)',
+      );
     }
   }
 
   const api = poolApis[idx];
-  try {
-    const numericId = chatId.replace(/^tg:/, '');
-    const MAX_LENGTH = 4096;
-    if (text.length <= MAX_LENGTH) {
-      await api.sendMessage(numericId, text);
-    } else {
-      for (let i = 0; i < text.length; i += MAX_LENGTH) {
-        await api.sendMessage(numericId, text.slice(i, i + MAX_LENGTH));
+  const numericId = chatId.replace(/^tg:/, '');
+  const MAX_LENGTH = 4096;
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length; i += MAX_LENGTH) {
+    chunks.push(text.slice(i, i + MAX_LENGTH));
+  }
+
+  for (const chunk of chunks) {
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await api.sendMessage(numericId, chunk);
+        lastErr = undefined;
+        break;
+      } catch (err) {
+        lastErr = err;
+        const retryAfter = (err as any)?.parameters?.retry_after ?? attempt * 2;
+        logger.debug(
+          { chatId, sender, attempt, retryAfter },
+          'Pool message send failed, retrying',
+        );
+        await new Promise((r) => setTimeout(r, retryAfter * 1000));
       }
     }
-    logger.info({ chatId, sender, poolIndex: idx, length: text.length }, 'Pool message sent');
-  } catch (err) {
-    logger.error({ chatId, sender, err }, 'Failed to send pool message');
+    if (lastErr) {
+      logger.error(
+        { chatId, sender, err: lastErr },
+        'Failed to send pool message after retries',
+      );
+    }
   }
+  logger.info(
+    { chatId, sender, poolIndex: idx, length: text.length },
+    'Pool message sent',
+  );
 }
 
 export class TelegramChannel implements Channel {
@@ -278,13 +333,267 @@ export class TelegramChannel implements Channel {
       });
     };
 
-    this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
+    this.bot.on('message:photo', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
+
+      let content = `[Photo]${caption}`;
+      try {
+        // Take the largest available size (last in array)
+        const photos = ctx.message.photo;
+        const largest = photos[photos.length - 1];
+        const file = await ctx.api.getFile(largest.file_id);
+        if (file.file_path) {
+          const mediaDir = path.join(
+            process.cwd(),
+            'groups',
+            group.folder,
+            'media',
+          );
+          fs.mkdirSync(mediaDir, { recursive: true });
+          const filename = `tg_photo_${ctx.message.message_id}.jpg`;
+          const localPath = path.join(mediaDir, filename);
+          await downloadTelegramFile(this.botToken, file.file_path, localPath);
+          const containerPath = `/workspace/group/media/${filename}`;
+          content = `[Photo: ${containerPath}]${caption}`;
+          logger.info(
+            { chatJid, containerPath },
+            'Telegram photo saved for agent',
+          );
+        }
+      } catch (err) {
+        logger.error({ err }, 'Photo download error');
+      }
+
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+    });
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
-    this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
-    this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
-    this.bot.on('message:document', (ctx) => {
-      const name = ctx.message.document?.file_name || 'file';
-      storeNonText(ctx, `[Document: ${name}]`);
+    this.bot.on('message:voice', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
+
+      let content = '[Voice message]';
+      let tmpPath: string | null = null;
+      try {
+        const file = await ctx.getFile();
+        if (file.file_path) {
+          tmpPath = path.join(
+            os.tmpdir(),
+            `tg_voice_${ctx.message.message_id}.ogg`,
+          );
+          await downloadTelegramFile(this.botToken, file.file_path, tmpPath);
+          const transcript = await transcribeAudioFile(tmpPath);
+          if (transcript) {
+            content = `[Voice: ${transcript}]`;
+            logger.info({ chatJid }, 'Telegram voice message transcribed');
+          }
+        }
+      } catch (err) {
+        logger.error({ err }, 'Voice transcription error');
+      } finally {
+        if (tmpPath) fs.unlink(tmpPath, () => {});
+      }
+
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+    });
+    this.bot.on('message:audio', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const audio = ctx.message.audio;
+      const name = audio?.file_name || `audio_${ctx.message.message_id}.ogg`;
+      const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
+
+      let content = `[Audio: ${name}]${caption}`;
+
+      if (audio?.file_id) {
+        try {
+          const file = await ctx.api.getFile(audio.file_id);
+          if (file.file_path) {
+            const attachDir = path.join(
+              process.cwd(),
+              'groups',
+              group.folder,
+              'attachments',
+            );
+            fs.mkdirSync(attachDir, { recursive: true });
+            const safeName = name.replace(/[^a-zA-Z0-9._-]/g, '_');
+            const filename = `tg_audio_${ctx.message.message_id}_${safeName}`;
+            const localPath = path.join(attachDir, filename);
+            await downloadTelegramFile(
+              this.botToken,
+              file.file_path,
+              localPath,
+            );
+            const containerPath = `/workspace/group/attachments/${filename}`;
+            content = `[Audio: ${containerPath}]${caption}`;
+            logger.info(
+              { chatJid, containerPath },
+              'Telegram audio saved for agent',
+            );
+          }
+        } catch (err: any) {
+          logger.warn(
+            { err: err?.message, name },
+            'Could not download Telegram audio (may exceed 20 MB limit)',
+          );
+        }
+      }
+
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+    });
+    this.bot.on('message:document', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const doc = ctx.message.document;
+      const name = doc?.file_name || 'file';
+      const mime = doc?.mime_type || '';
+      const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
+
+      let content = `[Document: ${name}]${caption}`;
+
+      // Download PDFs (and other documents) into the group attachments directory
+      if (doc?.file_id) {
+        try {
+          const file = await ctx.api.getFile(doc.file_id);
+          if (file.file_path) {
+            const attachDir = path.join(
+              process.cwd(),
+              'groups',
+              group.folder,
+              'attachments',
+            );
+            fs.mkdirSync(attachDir, { recursive: true });
+            const safeName = name.replace(/[^a-zA-Z0-9._-]/g, '_');
+            const filename = `tg_doc_${ctx.message.message_id}_${safeName}`;
+            const localPath = path.join(attachDir, filename);
+            await downloadTelegramFile(
+              this.botToken,
+              file.file_path,
+              localPath,
+            );
+            const containerPath = `/workspace/group/attachments/${filename}`;
+            const typeLabel = mime === 'application/pdf' ? 'PDF' : 'Document';
+            content = `[${typeLabel}: ${containerPath}]${caption}`;
+            logger.info(
+              { chatJid, containerPath, mime },
+              'Telegram document saved for agent',
+            );
+          }
+        } catch (err: any) {
+          // Telegram Bot API rejects files > 20 MB — fall back to placeholder
+          logger.warn(
+            { err: err?.message, name },
+            'Could not download Telegram document (may exceed 20 MB limit)',
+          );
+        }
+      }
+
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
     });
     this.bot.on('message:sticker', (ctx) => {
       const emoji = ctx.message.sticker?.emoji || '';
@@ -293,14 +602,141 @@ export class TelegramChannel implements Channel {
     this.bot.on('message:location', (ctx) => storeNonText(ctx, '[Location]'));
     this.bot.on('message:contact', (ctx) => storeNonText(ctx, '[Contact]'));
 
-    // Handle errors gracefully
-    this.bot.catch((err) => {
-      logger.error({ err: err.message }, 'Telegram bot error');
+    // Handle emoji reactions on messages
+    this.bot.on('message_reaction', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const reaction = ctx.update.message_reaction!;
+      const timestamp = new Date(reaction.date * 1000).toISOString();
+
+      const user = reaction.user;
+      const actorChat = (reaction as any).actor_chat;
+      const senderName = user
+        ? user.first_name || user.username || user.id.toString()
+        : actorChat?.title || 'Someone';
+      const sender = user ? user.id.toString() : '';
+
+      const toEmoji = (r: any): string =>
+        r.type === 'emoji' ? r.emoji : r.type === 'paid' ? '⭐' : '?';
+
+      const oldSet = new Set(reaction.old_reaction.map(toEmoji));
+      const newList = reaction.new_reaction.map(toEmoji);
+      const added = newList.filter((e) => !oldSet.has(e));
+      const removed = [...oldSet].filter((e) => !newList.includes(e));
+
+      let content: string;
+      if (added.length > 0) {
+        content = `[Reaction: ${added.join('')} on message #${reaction.message_id}]`;
+      } else if (removed.length > 0) {
+        content = `[Reaction removed: ${removed.join('')} on message #${reaction.message_id}]`;
+      } else {
+        return;
+      }
+
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
+      this.opts.onMessage(chatJid, {
+        id: `reaction_${reaction.message_id}_${reaction.date}`,
+        chat_jid: chatJid,
+        sender,
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+
+      logger.info(
+        { chatJid, content, sender: senderName },
+        'Telegram reaction received',
+      );
     });
 
-    // Start polling — returns a Promise that resolves when started
-    return new Promise<void>((resolve) => {
+
+    // Handle inline button callbacks (check-ins via send_checkin tool)
+    this.bot.on('callback_query:data', async (ctx) => {
+      const data = ctx.callbackQuery.data;
+      if (!data.startsWith('ckin:')) {
+        await ctx.answerCallbackQuery();
+        return;
+      }
+
+      // Parse format: ckin:{checkinId}:{value}
+      const firstColon = data.indexOf(':', 5);   // skip 'ckin:'
+      if (firstColon < 0) { await ctx.answerCallbackQuery(); return; }
+      const checkinId = data.slice(5, firstColon);
+      const value = data.slice(firstColon + 1);
+
+      await ctx.answerCallbackQuery();
+
+      const chatJid = `tg:${ctx.chat?.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) {
+        logger.warn({ chatJid }, 'Callback from unregistered chat');
+        return;
+      }
+
+      // Read metadata to get label and original question
+      let label = value;
+      let question = '';
+      try {
+        const metaPath = path.join(GROUPS_DIR, group.folder, 'checkin_meta', `${checkinId}.json`);
+        if (fs.existsSync(metaPath)) {
+          const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as {
+            question: string;
+            buttons: Array<{label: string, value: string}>;
+          };
+          question = meta.question || '';
+          const btn = meta.buttons?.find((b) => b.value === value);
+          if (btn) label = btn.label;
+        }
+      } catch (err) {
+        logger.warn({ checkinId, err }, 'Could not read checkin metadata');
+      }
+
+      // Edit the message to show the selection
+      try {
+        const editedText = question ? `${question}\n\n✅ *${label}*` : `✅ *${label}*`;
+        await ctx.editMessageText(editedText, { parse_mode: 'Markdown' });
+      } catch (err) {
+        logger.debug({ err }, 'Could not edit checkin message (may have expired)');
+      }
+
+      // Write result file for tasks to query
+      try {
+        const resultDir = path.join(GROUPS_DIR, group.folder, 'checkin_results');
+        fs.mkdirSync(resultDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(resultDir, `${checkinId}.json`),
+          JSON.stringify({
+            checkin_id: checkinId,
+            response_label: label,
+            response_value: value,
+            responded_at: new Date().toISOString(),
+          }, null, 2),
+        );
+        logger.info({ chatJid, checkinId, value }, 'Checkin response recorded');
+      } catch (err) {
+        logger.error({ checkinId, err }, 'Failed to write checkin result');
+      }
+    });
+
+    // Start polling — returns a Promise that resolves when started, rejects on error
+    return new Promise<void>((resolve, reject) => {
+      this.bot!.catch((err) => {
+        logger.error({ err: err.message }, 'Telegram bot error');
+        reject(err);
+      });
       this.bot!.start({
+        allowed_updates: ['message', 'message_reaction', 'callback_query'],
         onStart: (botInfo) => {
           logger.info(
             { username: botInfo.username, id: botInfo.id },
@@ -322,25 +758,117 @@ export class TelegramChannel implements Channel {
       return;
     }
 
-    try {
-      const numericId = jid.replace(/^tg:/, '');
+    const numericId = jid.replace(/^tg:/, '');
+    const MAX_LENGTH = 4096;
+    const chunks: string[] = [];
+    for (let i = 0; i < text.length; i += MAX_LENGTH) {
+      chunks.push(text.slice(i, i + MAX_LENGTH));
+    }
 
-      // Telegram has a 4096 character limit per message — split if needed
-      const MAX_LENGTH = 4096;
-      if (text.length <= MAX_LENGTH) {
-        await sendTelegramMessage(this.bot.api, numericId, text);
-      } else {
-        for (let i = 0; i < text.length; i += MAX_LENGTH) {
-          await sendTelegramMessage(
-            this.bot.api,
-            numericId,
-            text.slice(i, i + MAX_LENGTH),
+    for (const chunk of chunks) {
+      let lastErr: unknown;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await sendTelegramMessage(this.bot.api, numericId, chunk);
+          lastErr = undefined;
+          break;
+        } catch (err) {
+          lastErr = err;
+          // Respect Telegram's retry_after if present, otherwise back off
+          const retryAfter =
+            (err as any)?.parameters?.retry_after ?? attempt * 2;
+          logger.debug(
+            { jid, attempt, retryAfter },
+            'Telegram send failed, retrying',
           );
+          await new Promise((r) => setTimeout(r, retryAfter * 1000));
         }
       }
-      logger.info({ jid, length: text.length }, 'Telegram message sent');
+      if (lastErr) {
+        logger.error(
+          { jid, err: lastErr },
+          'Failed to send Telegram message after retries',
+        );
+      }
+    }
+    logger.info({ jid, length: text.length }, 'Telegram message sent');
+  }
+
+  async sendFile(
+    jid: string,
+    filePath: string,
+    caption?: string,
+  ): Promise<void> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized');
+      return;
+    }
+    try {
+      const numericId = jid.replace(/^tg:/, '');
+      const ext = path.extname(filePath).toLowerCase();
+      const isImage = ['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext);
+      const isVoice = ext === '.ogg';
+      if (isImage) {
+        await this.bot.api.sendPhoto(numericId, new InputFile(filePath), {
+          caption,
+        });
+      } else if (isVoice) {
+        await this.bot.api.sendVoice(numericId, new InputFile(filePath), {
+          caption,
+        });
+      } else {
+        await this.bot.api.sendDocument(numericId, new InputFile(filePath), {
+          caption,
+        });
+      }
+      logger.info({ jid, filePath }, 'Telegram file sent');
     } catch (err) {
-      logger.error({ jid, err }, 'Failed to send Telegram message');
+      logger.error({ jid, filePath, err }, 'Failed to send Telegram file');
+    }
+  }
+
+  async sendMessageWithButtons(
+    jid: string,
+    text: string,
+    buttons: Array<{label: string, value: string}>,
+    checkinId: string,
+  ): Promise<void> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized');
+      return;
+    }
+    const numericId = jid.replace(/^tg:/, '');
+
+    // Store metadata so the callback handler can look up labels
+    const group = this.opts.registeredGroups()[jid];
+    if (group) {
+      try {
+        const metaDir = path.join(GROUPS_DIR, group.folder, 'checkin_meta');
+        fs.mkdirSync(metaDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(metaDir, `${checkinId}.json`),
+          JSON.stringify({ question: text, buttons }, null, 2),
+        );
+      } catch (err) {
+        logger.warn({ checkinId, err }, 'Failed to write checkin metadata');
+      }
+    }
+
+    // Build inline keyboard (one button per row)
+    const inline_keyboard = buttons.map((btn) => [{
+      text: btn.label,
+      callback_data: `ckin:${checkinId}:${btn.value}`,
+    }]);
+
+    try {
+      await this.bot.api.sendMessage(numericId, text, {
+        reply_markup: { inline_keyboard },
+        parse_mode: 'Markdown',
+      });
+      logger.info({ jid, checkinId, buttons: buttons.length }, 'Checkin message sent');
+    } catch (err) {
+      logger.error({ jid, checkinId, err }, 'Failed to send checkin message');
+      throw err;
     }
   }
 
@@ -357,6 +885,28 @@ export class TelegramChannel implements Channel {
       this.bot.stop();
       this.bot = null;
       logger.info('Telegram bot stopped');
+    }
+  }
+
+  async sendReaction(
+    jid: string,
+    messageId: string,
+    emoji: string,
+  ): Promise<void> {
+    if (!this.bot) return;
+    try {
+      const numericId = jid.replace(/^tg:/, '');
+      await this.bot.api.setMessageReaction(
+        numericId,
+        parseInt(messageId, 10),
+        [{ type: 'emoji', emoji } as any],
+      );
+      logger.info({ jid, messageId, emoji }, 'Telegram reaction sent');
+    } catch (err) {
+      logger.error(
+        { jid, messageId, emoji, err },
+        'Failed to send Telegram reaction',
+      );
     }
   }
 

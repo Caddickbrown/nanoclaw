@@ -77,6 +77,31 @@ export interface TaskRunLog {
   error: string | null;
 }
 
+export interface Memory {
+  id: string;
+  group_folder: string;
+  content: string;
+  tags: string;
+  importance: number;
+  source: string;
+  created_at: string;
+}
+
+export interface Goal {
+  id: string;
+  group_folder: string;
+  title: string;
+  description: string;
+  status: 'active' | 'completed' | 'paused' | 'abandoned';
+  priority: 'high' | 'medium' | 'low';
+  target_date: string | null;
+  progress_notes: string;
+  autonomy_level: 'suggest' | 'light' | 'medium' | 'full';
+  action_context: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 // --- Channel abstraction ---
 
 export interface Channel {
@@ -90,6 +115,12 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
+  // Optional: send a file. filePath is an absolute path on the host.
+  sendFile?(jid: string, filePath: string, caption?: string): Promise<void>;
+  // Optional: react to a message with an emoji.
+  sendReaction?(jid: string, messageId: string, emoji: string): Promise<void>;
+  // Optional: send a message with Telegram inline keyboard buttons for check-ins.
+  sendMessageWithButtons?(jid: string, text: string, buttons: Array<{label: string, value: string}>, checkinId: string): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

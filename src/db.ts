@@ -6,6 +6,8 @@ import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import {
+  Goal,
+  Memory,
   NewMessage,
   RegisteredGroup,
   ScheduledTask,
@@ -36,6 +38,7 @@ function createSchema(database: Database.Database): void {
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
     CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_messages_jid_ts ON messages(chat_jid, timestamp);
 
     CREATE TABLE IF NOT EXISTS scheduled_tasks (
       id TEXT PRIMARY KEY,
@@ -82,6 +85,43 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+
+    CREATE TABLE IF NOT EXISTS usage_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT NOT NULL,
+      model TEXT NOT NULL,
+      input_tokens INTEGER DEFAULT 0,
+      output_tokens INTEGER DEFAULT 0,
+      is_streaming INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_log(timestamp);
+
+    CREATE TABLE IF NOT EXISTS memories (
+      id TEXT PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      content TEXT NOT NULL,
+      tags TEXT DEFAULT '',
+      importance INTEGER DEFAULT 3,
+      source TEXT DEFAULT 'agent',
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_memories_group ON memories(group_folder, created_at);
+
+    CREATE TABLE IF NOT EXISTS goals (
+      id TEXT PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      status TEXT DEFAULT 'active',
+      priority TEXT DEFAULT 'medium',
+      target_date TEXT,
+      progress_notes TEXT DEFAULT '[]',
+      autonomy_level TEXT DEFAULT 'suggest',
+      action_context TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_goals_group ON goals(group_folder, status);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -105,6 +145,14 @@ function createSchema(database: Database.Database): void {
   } catch {
     /* column already exists */
   }
+
+  // Add autonomy_level and action_context to goals if not present
+  try {
+    database.exec(`ALTER TABLE goals ADD COLUMN autonomy_level TEXT DEFAULT 'suggest'`);
+  } catch { /* already exists */ }
+  try {
+    database.exec(`ALTER TABLE goals ADD COLUMN action_context TEXT`);
+  } catch { /* already exists */ }
 
   // Add is_main column if it doesn't exist (migration for existing DBs)
   try {
@@ -146,6 +194,10 @@ export function initDatabase(): void {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
   db = new Database(dbPath);
+  db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = NORMAL');
+  db.pragma('cache_size = -64000'); // 64MB page cache
+  db.pragma('temp_store = MEMORY');
   createSchema(db);
 
   // Migrate from JSON files if they exist
@@ -319,7 +371,7 @@ export function getNewMessages(
       SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
       FROM messages
       WHERE timestamp > ? AND chat_jid IN (${placeholders})
-        AND is_bot_message = 0 AND content NOT LIKE ?
+        AND is_bot_message = 0 AND is_from_me = 0 AND content NOT LIKE ?
         AND content != '' AND content IS NOT NULL
       ORDER BY timestamp DESC
       LIMIT ?
@@ -352,7 +404,7 @@ export function getMessagesSince(
       SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
       FROM messages
       WHERE chat_jid = ? AND timestamp > ?
-        AND is_bot_message = 0 AND content NOT LIKE ?
+        AND content NOT LIKE ?
         AND content != '' AND content IS NOT NULL
       ORDER BY timestamp DESC
       LIMIT ?
@@ -632,6 +684,227 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Usage tracking ---
+
+export interface UsageRecord {
+  timestamp: string;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  is_streaming: boolean;
+}
+
+export function logUsage(record: UsageRecord): void {
+  if (!db) return;
+  try {
+    db.prepare(
+      `INSERT INTO usage_log (timestamp, model, input_tokens, output_tokens, is_streaming)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run(
+      record.timestamp,
+      record.model,
+      record.input_tokens,
+      record.output_tokens,
+      record.is_streaming ? 1 : 0,
+    );
+  } catch {
+    /* never break the caller */
+  }
+}
+
+export function getUsageSummary(sinceTimestamp?: string): {
+  total_input: number;
+  total_output: number;
+  total_requests: number;
+  by_model: Array<{
+    model: string;
+    input_tokens: number;
+    output_tokens: number;
+    requests: number;
+  }>;
+  since: string;
+} {
+  const since = sinceTimestamp || new Date(0).toISOString();
+  const rows = db
+    .prepare(
+      `SELECT model,
+              SUM(input_tokens) as input_tokens,
+              SUM(output_tokens) as output_tokens,
+              COUNT(*) as requests
+       FROM usage_log WHERE timestamp >= ?
+       GROUP BY model ORDER BY requests DESC`,
+    )
+    .all(since) as Array<{
+    model: string;
+    input_tokens: number;
+    output_tokens: number;
+    requests: number;
+  }>;
+
+  return {
+    total_input: rows.reduce((s, r) => s + r.input_tokens, 0),
+    total_output: rows.reduce((s, r) => s + r.output_tokens, 0),
+    total_requests: rows.reduce((s, r) => s + r.requests, 0),
+    by_model: rows,
+    since,
+  };
+}
+
+export function getRateLimits(): {
+  captured_at: string;
+  [key: string]: string;
+} | null {
+  const raw = getRouterState('rate_limits');
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+// --- Memory accessors ---
+
+export function saveMemory(
+  memory: Omit<Memory, 'id' | 'created_at'>,
+): string {
+  const id = `mem-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO memories (id, group_folder, content, tags, importance, source, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    memory.group_folder,
+    memory.content,
+    memory.tags || '',
+    memory.importance || 3,
+    memory.source || 'agent',
+    now,
+  );
+  return id;
+}
+
+export function searchMemories(
+  groupFolder: string,
+  query: string,
+  limit = 20,
+): Memory[] {
+  const like = `%${query}%`;
+  return db
+    .prepare(
+      `SELECT * FROM memories
+       WHERE group_folder = ? AND (content LIKE ? OR tags LIKE ?)
+       ORDER BY importance DESC, created_at DESC
+       LIMIT ?`,
+    )
+    .all(groupFolder, like, like, limit) as Memory[];
+}
+
+export function getRecentMemories(
+  groupFolder: string,
+  limit = 30,
+): Memory[] {
+  return db
+    .prepare(
+      `SELECT * FROM memories WHERE group_folder = ?
+       ORDER BY importance DESC, created_at DESC LIMIT ?`,
+    )
+    .all(groupFolder, limit) as Memory[];
+}
+
+export function deleteMemory(id: string): void {
+  db.prepare('DELETE FROM memories WHERE id = ?').run(id);
+}
+
+// --- Goal accessors ---
+
+export function createGoal(
+  goal: Omit<Goal, 'id' | 'created_at' | 'updated_at'>,
+): string {
+  const id = `goal-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO goals (id, group_folder, title, description, status, priority, target_date, progress_notes, autonomy_level, action_context, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    goal.group_folder,
+    goal.title,
+    goal.description,
+    goal.status || 'active',
+    goal.priority || 'medium',
+    goal.target_date || null,
+    goal.progress_notes || '[]',
+    goal.autonomy_level || 'suggest',
+    goal.action_context || null,
+    now,
+    now,
+  );
+  return id;
+}
+
+export function getGoalById(id: string): Goal | undefined {
+  return db.prepare('SELECT * FROM goals WHERE id = ?').get(id) as
+    | Goal
+    | undefined;
+}
+
+export function updateGoal(
+  id: string,
+  updates: Partial<Pick<Goal, 'title' | 'description' | 'status' | 'priority' | 'target_date' | 'progress_notes' | 'autonomy_level' | 'action_context'>>,
+): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+
+  for (const [key, value] of Object.entries(updates)) {
+    if (value !== undefined) {
+      fields.push(`${key} = ?`);
+      values.push(value);
+    }
+  }
+  if (fields.length === 0) return;
+
+  fields.push('updated_at = ?');
+  values.push(new Date().toISOString());
+  values.push(id);
+
+  db.prepare(`UPDATE goals SET ${fields.join(', ')} WHERE id = ?`).run(
+    ...values,
+  );
+}
+
+export function listGoals(groupFolder: string, statusFilter?: string): Goal[] {
+  if (statusFilter) {
+    return db
+      .prepare(
+        `SELECT * FROM goals WHERE group_folder = ? AND status = ? ORDER BY priority DESC, created_at DESC`,
+      )
+      .all(groupFolder, statusFilter) as Goal[];
+  }
+  return db
+    .prepare(
+      `SELECT * FROM goals WHERE group_folder = ? ORDER BY status ASC, priority DESC, created_at DESC`,
+    )
+    .all(groupFolder) as Goal[];
+}
+
+export function getGoalByTitle(title: string, groupFolder: string): Goal | undefined {
+  return db
+    .prepare(
+      `SELECT * FROM goals WHERE title = ? AND group_folder = ? AND status != 'abandoned' AND status != 'completed' LIMIT 1`,
+    )
+    .get(title, groupFolder) as Goal | undefined;
+}
+
+export function addGoalProgress(id: string, note: string): void {
+  const goal = getGoalById(id);
+  if (!goal) return;
+  const notes = JSON.parse(goal.progress_notes || '[]') as string[];
+  notes.push(`[${new Date().toISOString().slice(0, 10)}] ${note}`);
+  updateGoal(id, { progress_notes: JSON.stringify(notes) });
 }
 
 // --- JSON migration ---

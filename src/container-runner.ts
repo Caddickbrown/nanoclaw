@@ -27,6 +27,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -42,6 +43,7 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  taskId?: string;
 }
 
 export interface ContainerOutput {
@@ -55,6 +57,24 @@ interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
+}
+
+function copyIfNewer(src: string, dst: string): void {
+  fs.mkdirSync(dst, { recursive: true });
+  for (const entry of fs.readdirSync(src)) {
+    const srcPath = path.join(src, entry);
+    const dstPath = path.join(dst, entry);
+    const srcStat = fs.statSync(srcPath);
+    if (srcStat.isDirectory()) {
+      copyIfNewer(srcPath, dstPath);
+    } else {
+      if (!fs.existsSync(dstPath) || srcStat.mtimeMs > fs.statSync(dstPath).mtimeMs) {
+        fs.copyFileSync(srcPath, dstPath);
+        const srcStat2 = fs.statSync(srcPath);
+        fs.utimesSync(dstPath, srcStat2.atime, srcStat2.mtime);
+      }
+    }
+  }
 }
 
 function buildVolumeMounts(
@@ -202,8 +222,8 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
-    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+  if (fs.existsSync(agentRunnerSrc)) {
+    copyIfNewer(agentRunnerSrc, groupAgentRunnerDir);
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,
@@ -227,11 +247,19 @@ function buildVolumeMounts(
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  extraEnv?: Record<string, string>,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Pass Exa API key if configured (used by exa-search script)
+  const exaSecrets = readEnvFile(['EXA_API_KEY']);
+  const exaKey = process.env.EXA_API_KEY || exaSecrets.EXA_API_KEY;
+  if (exaKey) {
+    args.push('-e', `EXA_API_KEY=${exaKey}`);
+  }
 
   // Route API traffic through the credential proxy (containers never see real secrets)
   args.push(
@@ -263,6 +291,12 @@ function buildContainerArgs(
     args.push('-e', 'HOME=/home/node');
   }
 
+  if (extraEnv) {
+    for (const [key, value] of Object.entries(extraEnv)) {
+      args.push('-e', `${key}=${value}`);
+    }
+  }
+
   for (const mount of mounts) {
     if (mount.readonly) {
       args.push(...readonlyMountArgs(mount.hostPath, mount.containerPath));
@@ -290,7 +324,9 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+  const extraEnv: Record<string, string> = {};
+  if (input.taskId) extraEnv.NANOCLAW_TASK_ID = input.taskId;
+  const containerArgs = buildContainerArgs(mounts, containerName, extraEnv);
 
   logger.debug(
     {
@@ -678,6 +714,41 @@ export function writeTasksSnapshot(
 
   const tasksFile = path.join(groupIpcDir, 'current_tasks.json');
   fs.writeFileSync(tasksFile, JSON.stringify(filteredTasks, null, 2));
+}
+
+
+export function writeRateLimitsSnapshot(
+  groupFolder: string,
+  rateLimits: Record<string, string> | null,
+): void {
+  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  fs.mkdirSync(groupIpcDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(groupIpcDir, 'rate_limits.json'),
+    JSON.stringify(rateLimits ?? {}, null, 2),
+  );
+}
+
+export function writeGoalsSnapshot(
+  groupFolder: string,
+  goals: Array<{
+    id: string;
+    title: string;
+    description: string;
+    status: string;
+    priority: string;
+    target_date: string | null;
+    progress_notes: string;
+    created_at: string;
+    updated_at: string;
+  }>,
+): void {
+  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  fs.mkdirSync(groupIpcDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(groupIpcDir, 'current_goals.json'),
+    JSON.stringify(goals, null, 2),
+  );
 }
 
 export interface AvailableGroup {

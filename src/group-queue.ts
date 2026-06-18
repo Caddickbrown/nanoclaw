@@ -144,6 +144,8 @@ export class GroupQueue {
   /**
    * Mark the container as idle-waiting (finished work, waiting for IPC input).
    * If tasks are pending, preempt the idle container immediately.
+   * If only messages are pending, do NOT close — the message loop in index.ts
+   * polls every 2 s and will pipe them to the running container on the next cycle.
    */
   notifyIdle(groupJid: string): void {
     const state = this.getGroup(groupJid);
@@ -151,17 +153,40 @@ export class GroupQueue {
     if (state.pendingTasks.length > 0) {
       this.closeStdin(groupJid);
     }
+    // pendingMessages: do NOT close — the message loop pipes on the next poll cycle
+  }
+
+  /**
+   * Returns true if there's an active message-processing container for this group.
+   * Task containers are excluded — typing indicators only make sense for user messages.
+   */
+  isActiveMessageContainer(groupJid: string): boolean {
+    const state = this.groups.get(groupJid);
+    return (
+      (state?.active ?? false) &&
+      !(state?.isTaskContainer ?? true) &&
+      !(state?.idleWaiting ?? false)
+    );
   }
 
   /**
    * Send a follow-up message to the active container via IPC file.
    * Returns true if the message was written, false if no active container.
+   * Only pipes when the agent is idle-waiting (finished its current turn) —
+   * this prevents a new message from interrupting mid-tool-use and causing
+   * a null result (undelivered response).
    */
   sendMessage(groupJid: string, text: string): boolean {
     const state = this.getGroup(groupJid);
     if (!state.active || !state.groupFolder || state.isTaskContainer)
       return false;
-    state.idleWaiting = false; // Agent is about to receive work, no longer idle
+    // Don't interrupt an active turn — queue for next container run instead
+    if (!state.idleWaiting) {
+      state.pendingMessages = true;
+      return false;
+    }
+    state.idleWaiting = false;     // Agent is about to receive work, no longer idle
+    state.pendingMessages = false; // Clear stale flag — message is being delivered now
 
     const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
     try {

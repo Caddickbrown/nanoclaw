@@ -84,16 +84,29 @@ export class GmailChannel implements Channel {
 
     this.gmail = google.gmail({ version: 'v1', auth: this.oauth2Client });
 
-    // Verify connection
-    const profile = await this.gmail.users.getProfile({ userId: 'me' });
-    this.userEmail = profile.data.emailAddress || '';
-    logger.info({ email: this.userEmail }, 'Gmail channel connected');
+    // Verify connection — if this throws, null out gmail so isConnected() returns false
+    try {
+      const profile = await this.gmail.users.getProfile({ userId: 'me' });
+      this.userEmail = profile.data.emailAddress || '';
+      logger.info({ email: this.userEmail }, 'Gmail channel connected');
+    } catch (err) {
+      this.gmail = null;
+      logger.error({ err }, 'Gmail getProfile failed — channel not started');
+      return;
+    }
+
+    // Load persisted thread metadata
+    this.loadThreadMeta();
 
     // Start polling with error backoff
     const schedulePoll = () => {
-      const backoffMs = this.consecutiveErrors > 0
-        ? Math.min(this.pollIntervalMs * Math.pow(2, this.consecutiveErrors), 30 * 60 * 1000)
-        : this.pollIntervalMs;
+      const backoffMs =
+        this.consecutiveErrors > 0
+          ? Math.min(
+              this.pollIntervalMs * Math.pow(2, this.consecutiveErrors),
+              30 * 60 * 1000,
+            )
+          : this.pollIntervalMs;
       this.pollTimer = setTimeout(() => {
         this.pollForMessages()
           .catch((err) => logger.error({ err }, 'Gmail poll error'))
@@ -177,6 +190,42 @@ export class GmailChannel implements Channel {
 
   // --- Private ---
 
+  private get threadMetaPath(): string {
+    return path.join(os.homedir(), '.gmail-mcp', 'thread-meta.json');
+  }
+
+  private loadThreadMeta(): void {
+    try {
+      if (fs.existsSync(this.threadMetaPath)) {
+        const raw = fs.readFileSync(this.threadMetaPath, 'utf-8');
+        const obj = JSON.parse(raw) as Record<string, ThreadMeta>;
+        for (const [k, v] of Object.entries(obj)) {
+          this.threadMeta.set(k, v);
+        }
+        logger.debug(
+          { count: this.threadMeta.size },
+          'Gmail thread metadata loaded from disk',
+        );
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Failed to load Gmail thread metadata from disk');
+    }
+  }
+
+  private saveThreadMeta(): void {
+    try {
+      const obj: Record<string, ThreadMeta> = {};
+      for (const [k, v] of this.threadMeta.entries()) {
+        obj[k] = v;
+      }
+      const tmp = `${this.threadMetaPath}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+      fs.renameSync(tmp, this.threadMetaPath);
+    } catch (err) {
+      logger.warn({ err }, 'Failed to persist Gmail thread metadata');
+    }
+  }
+
   private buildQuery(): string {
     return 'is:unread category:primary';
   }
@@ -210,8 +259,18 @@ export class GmailChannel implements Channel {
       this.consecutiveErrors = 0;
     } catch (err) {
       this.consecutiveErrors++;
-      const backoffMs = Math.min(this.pollIntervalMs * Math.pow(2, this.consecutiveErrors), 30 * 60 * 1000);
-      logger.error({ err, consecutiveErrors: this.consecutiveErrors, nextPollMs: backoffMs }, 'Gmail poll failed');
+      const backoffMs = Math.min(
+        this.pollIntervalMs * Math.pow(2, this.consecutiveErrors),
+        30 * 60 * 1000,
+      );
+      logger.error(
+        {
+          err,
+          consecutiveErrors: this.consecutiveErrors,
+          nextPollMs: backoffMs,
+        },
+        'Gmail poll failed',
+      );
     }
   }
 
@@ -255,22 +314,21 @@ export class GmailChannel implements Channel {
 
     const chatJid = `gmail:${threadId}`;
 
-    // Cache thread metadata for replies
+    // Cache thread metadata for replies (persisted across restarts)
     this.threadMeta.set(threadId, {
       sender: senderEmail,
       senderName,
       subject,
       messageId: rfc2822MessageId,
     });
+    this.saveThreadMeta();
 
     // Store chat metadata for group discovery
     this.opts.onChatMetadata(chatJid, timestamp, subject, 'gmail', false);
 
     // Find the main group to deliver the email notification
     const groups = this.opts.registeredGroups();
-    const mainEntry = Object.entries(groups).find(
-      ([, g]) => g.isMain === true,
-    );
+    const mainEntry = Object.entries(groups).find(([, g]) => g.isMain === true);
 
     if (!mainEntry) {
       logger.debug(

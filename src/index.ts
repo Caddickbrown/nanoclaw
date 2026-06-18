@@ -1,6 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 
+import { CronExpressionParser } from 'cron-parser';
+
 import {
   ASSISTANT_NAME,
   CREDENTIAL_PROXY_PORT,
@@ -20,7 +22,9 @@ import {
 import {
   ContainerOutput,
   runContainerAgent,
+  writeGoalsSnapshot,
   writeGroupsSnapshot,
+  writeRateLimitsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
 import {
@@ -29,25 +33,34 @@ import {
   PROXY_BIND_HOST,
 } from './container-runtime.js';
 import {
+  createGoal,
+  createTask,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
   getAllTasks,
+  getGoalById,
   getMessagesSince,
   getNewMessages,
+  getRateLimits,
   getRegisteredGroup,
   getRouterState,
+  getTaskById,
   initDatabase,
+  listGoals,
   setRegisteredGroup,
   setRouterState,
   setSession,
   storeChatMetadata,
   storeMessage,
+  storeMessageDirect,
+  updateGoal,
+  updateTask,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import { findChannel, formatMessages, formatOutbound, stripInternalTags } from './router.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
@@ -59,12 +72,32 @@ import {
   loadSenderAllowlist,
   shouldDropMessage,
 } from './sender-allowlist.js';
+import { startDashboardServer } from './dashboard-server.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
+
+import type { Goal } from './types.js';
+
+function buildContextPreamble(goals: Goal[]): string {
+  const activeGoals = goals.filter((g) => g.status === 'active');
+  if (activeGoals.length === 0) return '';
+
+  const lines = activeGoals
+    .map((g) => {
+      const due = g.target_date ? ` (due: ${g.target_date})` : '';
+      const notes = JSON.parse(g.progress_notes || '[]') as string[];
+      const lastNote =
+        notes.length > 0 ? `\n    Last: ${notes[notes.length - 1]}` : '';
+      return `  - [${g.id}] ${g.priority.toUpperCase()} | ${g.title}${due}: ${g.description}${lastNote}`;
+    })
+    .join('\n');
+
+  return `<active_goals>\n${lines}\n</active_goals>\n\n`;
+}
 
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
@@ -163,18 +196,27 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const isMainGroup = group.isMain === true;
 
   const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
+  // Full context: user messages + bot responses since the cursor so the agent
+  // can see the conversation history including what it previously said.
   const missedMessages = getMessagesSince(
     chatJid,
     sinceTimestamp,
     ASSISTANT_NAME,
   );
+  // Non-bot messages: used for trigger checks and cursor advancement.
+  // is_bot_message is true only for NanoClaw's own stored responses (storeMessageDirect).
+  // Do NOT use is_from_me here — in Telegram DMs the user's own messages also have
+  // is_from_me=true, so that field cannot distinguish user messages from bot responses.
+  // Bot message timestamps can also be newer than user messages (stored at send time),
+  // so the cursor must only advance to non-bot timestamps to avoid skipping queued messages.
+  const nonBotMessages = missedMessages.filter((m) => !m.is_bot_message);
 
-  if (missedMessages.length === 0) return true;
+  if (nonBotMessages.length === 0) return true;
 
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
     const allowlistCfg = loadSenderAllowlist();
-    const hasTrigger = missedMessages.some(
+    const hasTrigger = nonBotMessages.some(
       (m) =>
         TRIGGER_PATTERN.test(m.content.trim()) &&
         (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
@@ -184,11 +226,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
 
-  // Advance cursor so the piping path in startMessageLoop won't re-fetch
-  // these messages. Save the old cursor so we can roll back on error.
+  // Advance cursor to last non-bot message timestamp. Never use bot message
+  // timestamps: they are stored at send-time and can be newer than queued user
+  // messages, which would cause those user messages to be skipped.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
   lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
+    nonBotMessages[nonBotMessages.length - 1].timestamp;
   saveState();
 
   logger.info(
@@ -222,10 +265,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           ? result.result
           : JSON.stringify(result.result);
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+      const text = stripInternalTags(raw);
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
         await channel.sendMessage(chatJid, text);
+        const ts = new Date().toISOString();
+        storeMessageDirect({
+          id: `bot_${chatJid}_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+          chat_jid: chatJid,
+          sender: 'bot',
+          sender_name: ASSISTANT_NAME,
+          content: text,
+          timestamp: ts,
+          is_from_me: true,
+          is_bot_message: true,
+        });
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -260,6 +314,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     logger.warn(
       { group: group.name },
       'Agent error, rolled back message cursor for retry',
+    );
+    return false;
+  }
+
+  // If the agent ran without error but sent no output (null result), roll back
+  // the cursor and retry — handles rate-limit interruptions and other silent failures.
+  if (!outputSentToUser) {
+    lastAgentTimestamp[chatJid] = previousCursor;
+    saveState();
+    logger.warn(
+      { group: group.name },
+      'Agent returned no output, rolling back cursor for retry',
     );
     return false;
   }
@@ -301,6 +367,13 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
+  // Write goal and rate limit snapshots + inject active goals as context
+  const goals = listGoals(group.folder);
+  writeGoalsSnapshot(group.folder, goals);
+  writeRateLimitsSnapshot(group.folder, getRateLimits());
+  const preamble = buildContextPreamble(goals);
+  const fullPrompt = preamble ? `${preamble}${prompt}` : prompt;
+
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
@@ -316,7 +389,7 @@ async function runAgent(
     const output = await runContainerAgent(
       group,
       {
-        prompt,
+        prompt: fullPrompt,
         sessionId,
         groupFolder: group.folder,
         chatJid,
@@ -427,9 +500,13 @@ async function startMessageLoop(): Promise<void> {
               { chatJid, count: messagesToSend.length },
               'Piped messages to active container',
             );
-            lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
-            saveState();
+            // Only advance to the last non-bot message timestamp — bot message
+            // timestamps can be newer than queued user messages and would skip them.
+            const lastNonBotMsg = messagesToSend.filter((m) => !m.is_bot_message).at(-1);
+            if (lastNonBotMsg) {
+              lastAgentTimestamp[chatJid] = lastNonBotMsg.timestamp;
+              saveState();
+            }
             // Show typing indicator while the container processes the piped message
             channel
               .setTyping?.(chatJid, true)
@@ -445,6 +522,16 @@ async function startMessageLoop(): Promise<void> {
     } catch (err) {
       logger.error({ err }, 'Error in message loop');
     }
+
+    // Renew typing indicators for groups with active message containers.
+    // Telegram's typing indicator expires after ~5s, so we refresh it every poll cycle.
+    for (const chatJid of Object.keys(registeredGroups)) {
+      if (queue.isActiveMessageContainer(chatJid)) {
+        const channel = findChannel(channels, chatJid);
+        channel?.setTyping?.(chatJid, true)?.catch(() => {});
+      }
+    }
+
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
   }
 }
@@ -472,11 +559,204 @@ function ensureContainerSystemRunning(): void {
   cleanupOrphans();
 }
 
+const HEARTBEAT_PROMPT = `You are running as a proactive daily review agent.
+
+The user is on the Anthropic Max plan. Usage resets every Thursday at 20:00 local time.
+
+Steps:
+1. Check active goals: mcp__nanoclaw__list_goals
+
+2. Check weekly token usage pace. First get the last reset timestamp:
+   python3 -c "
+from datetime import datetime, timedelta
+now = datetime.now()
+days = (now.weekday() - 3) % 7
+reset = (now - timedelta(days=days)).replace(hour=20, minute=0, second=0, microsecond=0)
+if reset > now: reset -= timedelta(days=7)
+print(reset.isoformat())
+"
+   Then query usage since that reset (replace <RESET> with output above):
+   sqlite3 /workspace/project/store/messages.db "SELECT SUM(input_tokens+output_tokens) as total, COUNT(*) as calls FROM usage_log WHERE timestamp >= '<RESET>';"
+   And last week for comparison:
+   sqlite3 /workspace/project/store/messages.db "SELECT SUM(input_tokens+output_tokens) as total FROM usage_log WHERE timestamp >= datetime('<RESET>','-7 days') AND timestamp < '<RESET>';"
+   Calculate: days elapsed, days until next Thursday 20:00, projected total at current pace vs last week.
+   WARN the user if projected total is >30% above last week's total, or if pace is accelerating significantly.
+
+3. Scan recent context for anything needing follow-up.
+4. Check scheduled tasks: mcp__nanoclaw__list_tasks
+
+Decision:
+- Something needs attention → send a message.
+- Everything fine → output only <internal>Nothing to report today.</internal>
+
+Adjust schedule if needed: mcp__nanoclaw__reschedule_self
+Be concise. Only message when there's genuine value.`;
+
+function ensureHeartbeatTask(
+  mainJid: string,
+  mainFolder: string,
+): void {
+  const schedule = '30 8 * * *';
+  let nextRun: string | undefined;
+  try {
+    nextRun =
+      CronExpressionParser.parse(schedule, { tz: TIMEZONE })
+        .next()
+        .toISOString() ?? undefined;
+  } catch {
+    return;
+  }
+  if (!nextRun) return;
+
+  const existing = getTaskById('heartbeat-main');
+  if (existing) {
+    // Always refresh prompt so config changes apply on restart
+    updateTask('heartbeat-main', { prompt: HEARTBEAT_PROMPT });
+    return;
+  }
+
+  createTask({
+    id: 'heartbeat-main',
+    group_folder: mainFolder,
+    chat_jid: mainJid,
+    prompt: HEARTBEAT_PROMPT,
+    schedule_type: 'cron',
+    schedule_value: schedule,
+    context_mode: 'group',
+    next_run: nextRun,
+    status: 'active',
+    created_at: new Date().toISOString(),
+  });
+
+  logger.info({ nextRun }, 'Heartbeat task registered');
+}
+
+const GOAL_REVIEW_PROMPT = `You are running a proactive goal review. Check active goals and propose concrete next actions.
+
+Steps:
+1. Load active goals: mcp__nanoclaw__list_goals (status: active)
+
+2. For each goal with autonomy_level "light", "medium", or "full":
+   - Parse action_context JSON if present (contains tool config like linear_team_id, linear_project_name)
+   - Query the relevant tool for current state
+   - Identify 2-3 specific actionable next steps
+
+3. For goals with Linear action context, query Linear:
+   python3 << 'EOF'
+   import urllib.request, json
+   KEY = open('/workspace/group/docs/linear_key.txt').read().strip() if __import__('os').path.exists('/workspace/group/docs/linear_key.txt') else None
+   if not KEY:
+       import sys
+       # Read from linear.md
+       with open('/workspace/group/docs/linear.md') as f:
+           for line in f:
+               if 'lin_api_' in line and 'caddickbrown' in line.lower():
+                   KEY = line.split('lin_api_')[1].split('|')[0].strip()
+                   KEY = 'lin_api_' + KEY
+                   break
+               elif 'Use this for everything' in line:
+                   pass
+   # Get project issues
+   def gql(q, v=None):
+       body = json.dumps({'query': q, 'variables': v or {}}).encode()
+       req = urllib.request.Request('https://api.linear.app/graphql', data=body,
+           headers={'Authorization': KEY, 'Content-Type': 'application/json'})
+       return json.loads(urllib.request.urlopen(req).read())
+   # List projects to find ID
+   r = gql('{ projects(first: 20) { nodes { id name } } }')
+   for p in r['data']['projects']['nodes']:
+       print(p['id'], p['name'])
+   EOF
+
+   Then fetch open issues for the relevant project and summarize: what's in progress, what's unstarted and ready, what's blocked.
+
+4. Formulate 2-3 concrete options for each actionable goal. Be specific — not "work on Island" but "pick up issue CAD-42 (Tile rendering system) which is unstarted and unblocked".
+
+5. Send message ONLY if there are actionable suggestions. Format:
+   *Goal: [title]* ([autonomy_level])
+   Options:
+   • Option A: [specific action]
+   • Option B: [specific action]
+
+   Reply with a number to act, or "skip" to move on.
+
+If no goals have meaningful options right now, output only:
+<internal>Goal review: nothing actionable this cycle.</internal>`;
+
+function ensureGoalReviewTask(mainJid: string, mainFolder: string): void {
+  // Mon, Wed, Fri at 10:00
+  const schedule = '0 10 * * 1,3,5';
+  let nextRun: string | undefined;
+  try {
+    nextRun =
+      CronExpressionParser.parse(schedule, { tz: TIMEZONE })
+        .next()
+        .toISOString() ?? undefined;
+  } catch {
+    return;
+  }
+  if (!nextRun) return;
+
+  const existing = getTaskById('goal-review-main');
+  if (existing) {
+    updateTask('goal-review-main', { prompt: GOAL_REVIEW_PROMPT });
+    return;
+  }
+
+  createTask({
+    id: 'goal-review-main',
+    group_folder: mainFolder,
+    chat_jid: mainJid,
+    prompt: GOAL_REVIEW_PROMPT,
+    schedule_type: 'cron',
+    schedule_value: schedule,
+    context_mode: 'group',
+    next_run: nextRun,
+    status: 'active',
+    created_at: new Date().toISOString(),
+  });
+
+  logger.info({ nextRun }, 'Goal review task registered');
+}
+
+const ISLAND_GOAL_ID = 'goal-island-engine';
+
+function ensureIslandGoal(mainFolder: string): void {
+  const existing = getGoalById(ISLAND_GOAL_ID);
+  if (existing) return;
+
+  createGoal({
+    group_folder: mainFolder,
+    title: 'Island Engine',
+    description:
+      'Build the Island game — an island sim with zones, prototype systems, characters, job mini-games, and a solarpunk world. Track progress via Linear Island project.',
+    status: 'active',
+    priority: 'high',
+    target_date: null,
+    progress_notes: '[]',
+    autonomy_level: 'light',
+    action_context: JSON.stringify({
+      linear_team_id: '40839dfc-0149-415a-8a3e-3fd46c5b3c66',
+      linear_project_name: 'Island',
+    }),
+  });
+
+  logger.info('Island Engine goal created');
+}
+
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
   loadState();
+
+  const mainEntry = Object.entries(registeredGroups).find(([, g]) => g.isMain);
+  if (mainEntry) {
+    ensureHeartbeatTask(mainEntry[0], mainEntry[1].folder);
+    ensureGoalReviewTask(mainEntry[0], mainEntry[1].folder);
+    ensureIslandGoal(mainEntry[1].folder);
+  }
+
   restoreRemoteControl();
 
   // Start credential proxy (containers route API calls through this)
@@ -485,10 +765,14 @@ async function main(): Promise<void> {
     PROXY_BIND_HOST,
   );
 
+  // Start cron dashboard server
+  const dashboardServer = await startDashboardServer();
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     proxyServer.close();
+    dashboardServer.close();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
@@ -617,7 +901,20 @@ async function main(): Promise<void> {
         return;
       }
       const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(jid, text);
+      if (text) {
+        await channel.sendMessage(jid, text);
+        const ts = new Date().toISOString();
+        storeMessageDirect({
+          id: `bot_${jid}_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+          chat_jid: jid,
+          sender: 'bot',
+          sender_name: ASSISTANT_NAME,
+          content: text,
+          timestamp: ts,
+          is_from_me: true,
+          is_bot_message: true,
+        });
+      }
     },
   });
   startIpcWatcher({
@@ -625,6 +922,27 @@ async function main(): Promise<void> {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       return channel.sendMessage(jid, text);
+    },
+    sendFile: (jid, filePath, caption) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (!channel.sendFile)
+        throw new Error(`Channel for ${jid} does not support sendFile`);
+      return channel.sendFile(jid, filePath, caption);
+    },
+    sendReaction: (jid, messageId, emoji) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (!channel.sendReaction)
+        throw new Error(`Channel for ${jid} does not support sendReaction`);
+      return channel.sendReaction(jid, messageId, emoji);
+    },
+    sendMessageWithButtons: (jid, text, buttons, checkinId) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (!channel.sendMessageWithButtons)
+        throw new Error(`Channel for ${jid} does not support sendMessageWithButtons`);
+      return channel.sendMessageWithButtons(jid, text, buttons, checkinId);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

@@ -6,12 +6,16 @@ import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
 import {
   ContainerOutput,
   runContainerAgent,
+  writeGoalsSnapshot,
+  writeRateLimitsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
 import {
   getAllTasks,
   getDueTasks,
+  getRateLimits,
   getTaskById,
+  listGoals,
   logTaskRun,
   updateTask,
   updateTaskAfterRun,
@@ -129,7 +133,7 @@ async function runTask(
     return;
   }
 
-  // Update tasks snapshot for container to read (filtered by group)
+  // Update snapshots for container to read
   const isMain = group.isMain === true;
   const tasks = getAllTasks();
   writeTasksSnapshot(
@@ -145,6 +149,8 @@ async function runTask(
       next_run: t.next_run,
     })),
   );
+  writeGoalsSnapshot(task.group_folder, listGoals(task.group_folder));
+  writeRateLimitsSnapshot(task.group_folder, getRateLimits());
 
   let result: string | null = null;
   let error: string | null = null;
@@ -179,6 +185,7 @@ async function runTask(
         isMain,
         isScheduledTask: true,
         assistantName: ASSISTANT_NAME,
+        taskId: task.id,
       },
       (proc, containerName) =>
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
@@ -270,7 +277,19 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
       logger.error({ err }, 'Error in scheduler loop');
     }
 
-    setTimeout(loop, SCHEDULER_POLL_INTERVAL);
+    // Find how long until the next task is due
+    const allActive = getAllTasks().filter(
+      (t) => t.status === 'active' && t.next_run,
+    );
+    const now = Date.now();
+    let sleepMs = SCHEDULER_POLL_INTERVAL;
+    for (const t of allActive) {
+      const delay = new Date(t.next_run!).getTime() - now;
+      if (delay > 0 && delay < sleepMs) {
+        sleepMs = delay;
+      }
+    }
+    setTimeout(loop, sleepMs);
   };
 
   loop();

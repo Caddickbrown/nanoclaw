@@ -19,6 +19,7 @@ const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
 const groupFolder = process.env.NANOCLAW_GROUP_FOLDER!;
 const isMain = process.env.NANOCLAW_IS_MAIN === '1';
+const taskId = process.env.NANOCLAW_TASK_ID || null;
 
 function writeIpcFile(dir: string, data: object): string {
   fs.mkdirSync(dir, { recursive: true });
@@ -80,6 +81,8 @@ MESSAGING BEHAVIOR - The task agent's output is sent to the user or group. It ca
 \u2022 Always send a message (e.g., reminders, daily briefings)
 \u2022 Only send a message when there's something to report (e.g., "notify me if...")
 \u2022 Never send a message (background maintenance tasks)
+
+AVOID DOUBLE-SENDING: If the agent calls send_message("Reminder: do your physio"), it must NOT also output "Physio reminder sent" — that sends two messages. For reminders, write the prompt so the agent outputs the message text directly (no send_message call needed). Only use send_message inside a task when the agent needs to send multiple messages or send one mid-task while continuing to work.
 
 SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
 \u2022 cron: Standard cron expression (e.g., "*/5 * * * *" for every 5 minutes, "0 9 * * *" for daily at 9am LOCAL time)
@@ -330,6 +333,373 @@ Use available_groups.json to find the JID for a group. The folder name must be c
     return {
       content: [{ type: 'text' as const, text: `Group "${args.name}" registered. It will start receiving messages immediately.` }],
     };
+  },
+);
+
+server.tool(
+  'send_file',
+  `Send a local file to the user via Telegram. The file must be saved to /workspace/ipc/files/ first.
+
+Example usage:
+1. Write your file to /workspace/ipc/files/report.pdf  (use Bash or Write tool)
+2. Call send_file with filePath="files/report.pdf"
+
+Supported file types: any file Telegram accepts (PDF, ZIP, images, text files, etc.)`,
+  {
+    filePath: z.string().describe('Path relative to /workspace/ipc/ (e.g., "files/report.pdf"). The file must exist at /workspace/ipc/{filePath}.'),
+    caption: z.string().optional().describe('Optional caption to send with the file'),
+  },
+  async (args) => {
+    // Validate the path stays within /workspace/ipc/files/
+    const filesDir = path.join(IPC_DIR, 'files');
+    const resolvedPath = path.resolve(IPC_DIR, args.filePath);
+    if (!resolvedPath.startsWith(filesDir + path.sep) && resolvedPath !== filesDir) {
+      return {
+        content: [{ type: 'text' as const, text: `Invalid filePath: must be under files/ (e.g., "files/report.pdf"). Got: "${args.filePath}"` }],
+        isError: true,
+      };
+    }
+    if (!fs.existsSync(resolvedPath)) {
+      return {
+        content: [{ type: 'text' as const, text: `File not found: /workspace/ipc/${args.filePath}` }],
+        isError: true,
+      };
+    }
+
+    const data: Record<string, string | undefined> = {
+      type: 'file',
+      chatJid,
+      filePath: args.filePath,
+      caption: args.caption,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: 'File queued for sending.' }] };
+  },
+);
+
+server.tool(
+  'send_reaction',
+  `React to a message with an emoji. Telegram only. Use this to acknowledge messages without sending text.
+
+The message_id comes from the incoming message context (e.g., "[Reaction: 👍 on message #1234]" or the message ID field).
+
+Common emoji reactions: 👍 👎 ❤️ 🔥 🎉 😂 😮 😢 🙏`,
+  {
+    message_id: z.string().describe('The Telegram message ID to react to'),
+    emoji: z.string().describe('The emoji to react with (e.g., "👍", "❤️", "🔥")'),
+  },
+  async (args) => {
+    const data: Record<string, string> = {
+      type: 'reaction',
+      chatJid,
+      messageId: args.message_id,
+      emoji: args.emoji,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: 'Reaction sent.' }] };
+  },
+);
+
+server.tool(
+  'fetch_rendered',
+  'Fetch a URL using a headless browser that executes JavaScript. Use for React/Vue/Angular apps, SPAs, lazy-loaded pages, or any site that renders content client-side. Returns visible page text.',
+  {
+    url: z.string().describe('The URL to fetch and render'),
+    timeout: z.number().optional().describe('Max seconds to wait for page load (default: 15)'),
+    wait_until: z.enum(['networkidle', 'domcontentloaded', 'load']).optional().describe('Page event to wait for before returning (default: networkidle)'),
+    max_length: z.number().optional().describe('Max characters to return (default: 8000)'),
+  },
+  async (args) => {
+    const { execFile } = await import('child_process');
+    const { promisify } = await import('util');
+    const execFileAsync = promisify(execFile);
+
+    const timeout = args.timeout ?? 15;
+    const waitUntil = args.wait_until ?? 'networkidle';
+    const maxLength = args.max_length ?? 8000;
+
+    try {
+      const { stdout, stderr } = await execFileAsync('python3', [
+        '/workspace/group/fetch_rendered.py',
+        args.url,
+        '--timeout', String(timeout),
+        '--max-length', String(maxLength),
+        '--wait-until', waitUntil,
+      ], { timeout: (timeout + 10) * 1000 });
+
+      const content = stdout || stderr || '(no content returned)';
+      return { content: [{ type: 'text' as const, text: content }] };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: 'text' as const, text: `fetch_rendered failed: ${message}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+
+server.tool(
+  'create_goal',
+  `Create a persistent goal or intention to track over time. Goals survive across sessions and are reviewed during proactive heartbeats.
+
+Use for things the user wants to achieve, habits to build, projects to complete, or ongoing intentions.
+
+AUTONOMY LEVELS — how proactively the agent should act on this goal:
+• suggest: Agent notices relevant opportunities and mentions them, but takes no action
+• light: Agent queries tools (e.g. Linear) and proposes specific options with next steps
+• medium: Agent takes minor reversible actions (e.g. create Linear issues, draft comments) and reports
+• full: Agent acts autonomously, only reporting outcomes
+
+ACTION CONTEXT — optional JSON with tool-specific config (e.g. {"linear_team_id": "xxx", "linear_project_id": "yyy"})`,
+  {
+    title: z.string().describe('Short goal title (e.g., "Exercise 3x per week")'),
+    description: z.string().describe('More detail about the goal and what success looks like'),
+    priority: z.enum(['high', 'medium', 'low']).optional().describe('Priority level (default: medium)'),
+    target_date: z.string().optional().describe('Optional target date in YYYY-MM-DD format'),
+    autonomy_level: z.enum(['suggest', 'light', 'medium', 'full']).optional().describe('How proactively to act on this goal (default: suggest)'),
+    action_context: z.string().optional().describe('JSON string with tool config, e.g. {"linear_team_id": "xxx", "linear_project_id": "yyy"}'),
+  },
+  async (args) => {
+    const data = {
+      type: 'create_goal',
+      title: args.title,
+      description: args.description,
+      priority: args.priority || 'medium',
+      target_date: args.target_date || null,
+      status: 'active',
+      autonomy_level: args.autonomy_level || 'suggest',
+      action_context: args.action_context || null,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+    writeIpcFile(TASKS_DIR, data);
+    return { content: [{ type: 'text' as const, text: `Goal "${args.title}" created (autonomy: ${args.autonomy_level || 'suggest'}).` }] };
+  },
+);
+
+server.tool(
+  'update_goal',
+  'Update an existing goal — change its status, autonomy level, add progress notes, update description or deadline.',
+  {
+    goal_id: z.string().describe('The goal ID to update'),
+    status: z.enum(['active', 'completed', 'paused', 'abandoned']).optional().describe('New status'),
+    priority: z.enum(['high', 'medium', 'low']).optional().describe('New priority'),
+    description: z.string().optional().describe('Updated description'),
+    target_date: z.string().optional().describe('New target date (YYYY-MM-DD)'),
+    progress_note: z.string().optional().describe('Add a progress note (appended to history)'),
+    autonomy_level: z.enum(['suggest', 'light', 'medium', 'full']).optional().describe('New autonomy level'),
+    action_context: z.string().optional().describe('Updated JSON config string'),
+  },
+  async (args) => {
+    const data: Record<string, unknown> = {
+      type: 'update_goal',
+      goalId: args.goal_id,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+    if (args.status !== undefined) data.status = args.status;
+    if (args.priority !== undefined) data.priority = args.priority;
+    if (args.description !== undefined) data.description = args.description;
+    if (args.target_date !== undefined) data.target_date = args.target_date;
+    if (args.progress_note !== undefined) data.progress_note = args.progress_note;
+    if (args.autonomy_level !== undefined) data.autonomy_level = args.autonomy_level;
+    if (args.action_context !== undefined) data.action_context = args.action_context;
+    writeIpcFile(TASKS_DIR, data);
+    return { content: [{ type: 'text' as const, text: `Goal ${args.goal_id} updated.` }] };
+  },
+);
+
+server.tool(
+  'list_goals',
+  'List tracked goals. Returns all goals or filtered by status.',
+  {
+    status: z.enum(['active', 'completed', 'paused', 'abandoned', 'all']).optional().describe('Filter by status (default: active)'),
+  },
+  async (args) => {
+    const goalsFile = path.join(IPC_DIR, 'current_goals.json');
+    try {
+      if (!fs.existsSync(goalsFile)) {
+        return { content: [{ type: 'text' as const, text: 'No goals found.' }] };
+      }
+      const allGoals = JSON.parse(fs.readFileSync(goalsFile, 'utf-8')) as Array<{
+        id: string; title: string; description: string; status: string;
+        priority: string; target_date: string | null; progress_notes: string;
+        autonomy_level: string; action_context: string | null;
+        created_at: string; updated_at: string;
+      }>;
+      const statusFilter = args.status || 'active';
+      const goals = statusFilter === 'all' ? allGoals : allGoals.filter(g => g.status === statusFilter);
+      if (goals.length === 0) {
+        return { content: [{ type: 'text' as const, text: `No ${statusFilter === 'all' ? '' : statusFilter + ' '}goals found.` }] };
+      }
+      const formatted = goals.map(g => {
+        const notes = JSON.parse(g.progress_notes || '[]') as string[];
+        const lastNote = notes.length > 0 ? `\n  Last update: ${notes[notes.length - 1]}` : '';
+        const autonomy = g.autonomy_level ? ` [${g.autonomy_level}]` : '';
+        return `[${g.id}] ${g.priority.toUpperCase()} | ${g.status}${autonomy} | ${g.title}${g.target_date ? ` (due: ${g.target_date})` : ''}\n  ${g.description}${lastNote}`;
+      }).join('\n\n');
+      return { content: [{ type: 'text' as const, text: `Goals:\n\n${formatted}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  'get_rate_limits',
+  `Get current Anthropic API rate limit status — how many tokens/requests remain in the current window and when it resets.
+
+Returns the most recently captured rate limit headers from the API. Updated on every API call the system makes.`,
+  {},
+  async () => {
+    const limitsFile = path.join(IPC_DIR, 'rate_limits.json');
+    try {
+      if (!fs.existsSync(limitsFile)) {
+        return { content: [{ type: 'text' as const, text: 'No rate limit data yet. Data is captured after the first API call.' }] };
+      }
+      const data = JSON.parse(fs.readFileSync(limitsFile, 'utf-8')) as Record<string, string>;
+      if (Object.keys(data).length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No rate limit headers captured yet.' }] };
+      }
+      const capturedAt = data.captured_at || 'unknown';
+      const lines: string[] = [`Rate limits (as of ${capturedAt}):\n`];
+      for (const [key, value] of Object.entries(data)) {
+        if (key === 'captured_at') continue;
+        // Format key nicely: anthropic-ratelimit-tokens-remaining → Tokens Remaining
+        const label = key.replace('anthropic-ratelimit-', '').replace(/-/g, ' ');
+        lines.push(`  ${label}: ${value}`);
+      }
+      return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  'reschedule_self',
+  `Change the schedule of the currently running task. Only works when running as a scheduled task.
+
+Use this when you want to adapt your own schedule based on context — e.g. increase frequency during busy periods, shift timing, or pause if nothing to monitor.`,
+  {
+    schedule_type: z.enum(['cron', 'interval']).describe('New schedule type'),
+    schedule_value: z.string().describe('New schedule value (cron expression or milliseconds)'),
+  },
+  async (args) => {
+    if (!taskId) {
+      return {
+        content: [{ type: 'text' as const, text: 'Not running as a scheduled task — reschedule_self is only available during task execution.' }],
+        isError: true,
+      };
+    }
+    if (args.schedule_type === 'cron') {
+      try {
+        CronExpressionParser.parse(args.schedule_value);
+      } catch {
+        return {
+          content: [{ type: 'text' as const, text: `Invalid cron: "${args.schedule_value}".` }],
+          isError: true,
+        };
+      }
+    } else if (args.schedule_type === 'interval') {
+      const ms = parseInt(args.schedule_value, 10);
+      if (isNaN(ms) || ms <= 0) {
+        return {
+          content: [{ type: 'text' as const, text: `Invalid interval: "${args.schedule_value}".` }],
+          isError: true,
+        };
+      }
+    }
+    const data = {
+      type: 'update_task',
+      taskId,
+      schedule_type: args.schedule_type,
+      schedule_value: args.schedule_value,
+      groupFolder,
+      isMain: String(isMain),
+      timestamp: new Date().toISOString(),
+    };
+    writeIpcFile(TASKS_DIR, data);
+    return { content: [{ type: 'text' as const, text: `Schedule updated to ${args.schedule_type}: ${args.schedule_value}` }] };
+  },
+);
+
+server.tool(
+  'send_checkin',
+  `Send a message with tap-to-respond inline buttons (Telegram only). Returns a checkin_id you can use with get_checkin_result to see if Dan responded.
+
+Use for quick responses: physio done, workout completed, task acknowledged, etc.
+
+Example: send_checkin("Did you do your physio?", [{label: "✅ Done", value: "done"}, {label: "❌ Missed", value: "missed"}, {label: "⏭ Skipped", value: "skipped"}])
+
+The buttons appear as tappable options in Telegram. Dan taps one, the message updates to show the choice, and the result is recorded. Call get_checkin_result with the returned ID to read the response.`,
+  {
+    text: z.string().describe('The question or prompt to show Dan'),
+    buttons: z.array(z.object({
+      label: z.string().describe('Button label shown in Telegram (e.g. "✅ Done")'),
+      value: z.string().max(20).describe('Short value stored when tapped (e.g. "done", "missed"). Keep short — no spaces.'),
+    })).min(1).max(6).describe('Button options (max 6)'),
+    task_context: z.string().optional().describe('Optional tag to identify this checkin (e.g. "physio-2026-05-05")'),
+  },
+  async (args) => {
+    const checkinId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    const data: Record<string, unknown> = {
+      type: 'message_with_buttons',
+      chatJid,
+      text: args.text,
+      buttons: args.buttons,
+      checkinId,
+      taskContext: args.task_context || null,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: `Check-in sent. ID: ${checkinId}\n\nCall get_checkin_result("${checkinId}") to see if Dan responded.`,
+      }],
+    };
+  },
+);
+
+server.tool(
+  'get_checkin_result',
+  'Check if Dan has responded to a check-in sent with send_checkin. Returns the response (label + value + timestamp) if available, or a "not yet answered" message.',
+  {
+    checkin_id: z.string().describe('The checkin ID returned by send_checkin'),
+  },
+  async (args) => {
+    const resultPath = path.join('/workspace/group/checkin_results', `${args.checkin_id}.json`);
+
+    if (!fs.existsSync(resultPath)) {
+      return {
+        content: [{ type: 'text' as const, text: `No response yet for checkin ${args.checkin_id}. Dan hasn't tapped a button yet.` }],
+      };
+    }
+
+    try {
+      const result = JSON.parse(fs.readFileSync(resultPath, 'utf-8'));
+      return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error reading checkin result: ${err}` }],
+        isError: true,
+      };
+    }
   },
 );
 
