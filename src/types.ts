@@ -120,7 +120,12 @@ export interface Channel {
   // Optional: react to a message with an emoji.
   sendReaction?(jid: string, messageId: string, emoji: string): Promise<void>;
   // Optional: send a message with Telegram inline keyboard buttons for check-ins.
-  sendMessageWithButtons?(jid: string, text: string, buttons: Array<{label: string, value: string}>, checkinId: string): Promise<void>;
+  sendMessageWithButtons?(
+    jid: string,
+    text: string,
+    buttons: Array<{ label: string; value: string }>,
+    checkinId: string,
+  ): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

@@ -38,7 +38,9 @@ function captureRateLimitHeaders(
         'rate_limits',
         JSON.stringify({ captured_at: new Date().toISOString(), ...data }),
       );
-    } catch { /* never break the proxy */ }
+    } catch {
+      /* never break the proxy */
+    }
   }
 }
 
@@ -172,7 +174,9 @@ export function startCredentialProxy(
                     } else if (data.type === 'message_delta' && data.usage) {
                       outputTokens = data.usage.output_tokens || outputTokens;
                     }
-                  } catch { /* ignore parse errors */ }
+                  } catch {
+                    /* ignore parse errors */
+                  }
                 }
               });
 
@@ -205,7 +209,9 @@ export function startCredentialProxy(
                       is_streaming: false,
                     });
                   }
-                } catch { /* ignore parse errors */ }
+                } catch {
+                  /* ignore parse errors */
+                }
               });
             }
           },

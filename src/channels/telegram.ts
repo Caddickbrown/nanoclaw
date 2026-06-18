@@ -660,7 +660,6 @@ export class TelegramChannel implements Channel {
       );
     });
 
-
     // Handle inline button callbacks (check-ins via send_checkin tool)
     this.bot.on('callback_query:data', async (ctx) => {
       const data = ctx.callbackQuery.data;
@@ -670,8 +669,11 @@ export class TelegramChannel implements Channel {
       }
 
       // Parse format: ckin:{checkinId}:{value}
-      const firstColon = data.indexOf(':', 5);   // skip 'ckin:'
-      if (firstColon < 0) { await ctx.answerCallbackQuery(); return; }
+      const firstColon = data.indexOf(':', 5); // skip 'ckin:'
+      if (firstColon < 0) {
+        await ctx.answerCallbackQuery();
+        return;
+      }
       const checkinId = data.slice(5, firstColon);
       const value = data.slice(firstColon + 1);
 
@@ -688,11 +690,16 @@ export class TelegramChannel implements Channel {
       let label = value;
       let question = '';
       try {
-        const metaPath = path.join(GROUPS_DIR, group.folder, 'checkin_meta', `${checkinId}.json`);
+        const metaPath = path.join(
+          GROUPS_DIR,
+          group.folder,
+          'checkin_meta',
+          `${checkinId}.json`,
+        );
         if (fs.existsSync(metaPath)) {
           const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as {
             question: string;
-            buttons: Array<{label: string, value: string}>;
+            buttons: Array<{ label: string; value: string }>;
           };
           question = meta.question || '';
           const btn = meta.buttons?.find((b) => b.value === value);
@@ -704,24 +711,37 @@ export class TelegramChannel implements Channel {
 
       // Edit the message to show the selection
       try {
-        const editedText = question ? `${question}\n\n✅ *${label}*` : `✅ *${label}*`;
+        const editedText = question
+          ? `${question}\n\n✅ *${label}*`
+          : `✅ *${label}*`;
         await ctx.editMessageText(editedText, { parse_mode: 'Markdown' });
       } catch (err) {
-        logger.debug({ err }, 'Could not edit checkin message (may have expired)');
+        logger.debug(
+          { err },
+          'Could not edit checkin message (may have expired)',
+        );
       }
 
       // Write result file for tasks to query
       try {
-        const resultDir = path.join(GROUPS_DIR, group.folder, 'checkin_results');
+        const resultDir = path.join(
+          GROUPS_DIR,
+          group.folder,
+          'checkin_results',
+        );
         fs.mkdirSync(resultDir, { recursive: true });
         fs.writeFileSync(
           path.join(resultDir, `${checkinId}.json`),
-          JSON.stringify({
-            checkin_id: checkinId,
-            response_label: label,
-            response_value: value,
-            responded_at: new Date().toISOString(),
-          }, null, 2),
+          JSON.stringify(
+            {
+              checkin_id: checkinId,
+              response_label: label,
+              response_value: value,
+              responded_at: new Date().toISOString(),
+            },
+            null,
+            2,
+          ),
         );
         logger.info({ chatJid, checkinId, value }, 'Checkin response recorded');
       } catch (err) {
@@ -830,7 +850,7 @@ export class TelegramChannel implements Channel {
   async sendMessageWithButtons(
     jid: string,
     text: string,
-    buttons: Array<{label: string, value: string}>,
+    buttons: Array<{ label: string; value: string }>,
     checkinId: string,
   ): Promise<void> {
     if (!this.bot) {
@@ -855,17 +875,22 @@ export class TelegramChannel implements Channel {
     }
 
     // Build inline keyboard (one button per row)
-    const inline_keyboard = buttons.map((btn) => [{
-      text: btn.label,
-      callback_data: `ckin:${checkinId}:${btn.value}`,
-    }]);
+    const inline_keyboard = buttons.map((btn) => [
+      {
+        text: btn.label,
+        callback_data: `ckin:${checkinId}:${btn.value}`,
+      },
+    ]);
 
     try {
       await this.bot.api.sendMessage(numericId, text, {
         reply_markup: { inline_keyboard },
         parse_mode: 'Markdown',
       });
-      logger.info({ jid, checkinId, buttons: buttons.length }, 'Checkin message sent');
+      logger.info(
+        { jid, checkinId, buttons: buttons.length },
+        'Checkin message sent',
+      );
     } catch (err) {
       logger.error({ jid, checkinId, err }, 'Failed to send checkin message');
       throw err;

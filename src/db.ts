@@ -148,11 +148,17 @@ function createSchema(database: Database.Database): void {
 
   // Add autonomy_level and action_context to goals if not present
   try {
-    database.exec(`ALTER TABLE goals ADD COLUMN autonomy_level TEXT DEFAULT 'suggest'`);
-  } catch { /* already exists */ }
+    database.exec(
+      `ALTER TABLE goals ADD COLUMN autonomy_level TEXT DEFAULT 'suggest'`,
+    );
+  } catch {
+    /* already exists */
+  }
   try {
     database.exec(`ALTER TABLE goals ADD COLUMN action_context TEXT`);
-  } catch { /* already exists */ }
+  } catch {
+    /* already exists */
+  }
 
   // Add is_main column if it doesn't exist (migration for existing DBs)
   try {
@@ -767,9 +773,7 @@ export function getRateLimits(): {
 
 // --- Memory accessors ---
 
-export function saveMemory(
-  memory: Omit<Memory, 'id' | 'created_at'>,
-): string {
+export function saveMemory(memory: Omit<Memory, 'id' | 'created_at'>): string {
   const id = `mem-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const now = new Date().toISOString();
   db.prepare(
@@ -803,10 +807,7 @@ export function searchMemories(
     .all(groupFolder, like, like, limit) as Memory[];
 }
 
-export function getRecentMemories(
-  groupFolder: string,
-  limit = 30,
-): Memory[] {
+export function getRecentMemories(groupFolder: string, limit = 30): Memory[] {
   return db
     .prepare(
       `SELECT * FROM memories WHERE group_folder = ?
@@ -854,7 +855,19 @@ export function getGoalById(id: string): Goal | undefined {
 
 export function updateGoal(
   id: string,
-  updates: Partial<Pick<Goal, 'title' | 'description' | 'status' | 'priority' | 'target_date' | 'progress_notes' | 'autonomy_level' | 'action_context'>>,
+  updates: Partial<
+    Pick<
+      Goal,
+      | 'title'
+      | 'description'
+      | 'status'
+      | 'priority'
+      | 'target_date'
+      | 'progress_notes'
+      | 'autonomy_level'
+      | 'action_context'
+    >
+  >,
 ): void {
   const fields: string[] = [];
   const values: unknown[] = [];
@@ -891,7 +904,10 @@ export function listGoals(groupFolder: string, statusFilter?: string): Goal[] {
     .all(groupFolder) as Goal[];
 }
 
-export function getGoalByTitle(title: string, groupFolder: string): Goal | undefined {
+export function getGoalByTitle(
+  title: string,
+  groupFolder: string,
+): Goal | undefined {
   return db
     .prepare(
       `SELECT * FROM goals WHERE title = ? AND group_folder = ? AND status != 'abandoned' AND status != 'completed' LIMIT 1`,

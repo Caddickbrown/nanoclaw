@@ -32,7 +32,7 @@ export interface IpcDeps {
   sendMessageWithButtons: (
     jid: string,
     text: string,
-    buttons: Array<{label: string, value: string}>,
+    buttons: Array<{ label: string; value: string }>,
     checkinId: string,
   ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
@@ -85,7 +85,7 @@ function watchGroupIpcDirs(
 
   for (const dir of dirsToWatch) {
     if (ipcWatchers.has(dir)) continue; // already watching
-    if (!fs.existsSync(dir)) continue;  // dir not yet created
+    if (!fs.existsSync(dir)) continue; // dir not yet created
 
     try {
       const watcher = fs.watch(dir, (eventType) => {
@@ -326,11 +326,15 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   await deps.sendMessageWithButtons(
                     data.chatJid,
                     data.text,
-                    data.buttons as Array<{label: string, value: string}>,
+                    data.buttons as Array<{ label: string; value: string }>,
                     data.checkinId,
                   );
                   logger.info(
-                    { chatJid: data.chatJid, checkinId: data.checkinId, sourceGroup },
+                    {
+                      chatJid: data.chatJid,
+                      checkinId: data.checkinId,
+                      sourceGroup,
+                    },
                     'IPC checkin message sent',
                   );
                 } else {
@@ -399,7 +403,9 @@ export function startIpcWatcher(deps: IpcDeps): void {
   };
 
   processIpcFiles();
-  logger.info('IPC watcher started (per-group namespaces, inotify + 5s fallback poll)');
+  logger.info(
+    'IPC watcher started (per-group namespaces, inotify + 5s fallback poll)',
+  );
 }
 
 export function stopIpcWatcher(): void {
@@ -740,7 +746,8 @@ export async function processTaskIpc(
           priority: (data.priority as 'medium') || 'medium',
           target_date: data.target_date || null,
           progress_notes: '[]',
-          autonomy_level: (data.autonomy_level as Goal['autonomy_level']) || 'suggest',
+          autonomy_level:
+            (data.autonomy_level as Goal['autonomy_level']) || 'suggest',
           action_context: data.action_context || null,
         });
         logger.info({ goalId, sourceGroup }, 'Goal created via IPC');
@@ -756,19 +763,37 @@ export async function processTaskIpc(
           }
           const goalFields = {
             ...(data.title !== undefined && { title: data.title }),
-            ...(data.description !== undefined && { description: data.description }),
-            ...(data.status !== undefined && { status: data.status as Goal['status'] }),
-            ...(data.priority !== undefined && { priority: data.priority as Goal['priority'] }),
-            ...(data.target_date !== undefined && { target_date: data.target_date }),
-            ...(data.autonomy_level !== undefined && { autonomy_level: data.autonomy_level as Goal['autonomy_level'] }),
-            ...(data.action_context !== undefined && { action_context: data.action_context }),
+            ...(data.description !== undefined && {
+              description: data.description,
+            }),
+            ...(data.status !== undefined && {
+              status: data.status as Goal['status'],
+            }),
+            ...(data.priority !== undefined && {
+              priority: data.priority as Goal['priority'],
+            }),
+            ...(data.target_date !== undefined && {
+              target_date: data.target_date,
+            }),
+            ...(data.autonomy_level !== undefined && {
+              autonomy_level: data.autonomy_level as Goal['autonomy_level'],
+            }),
+            ...(data.action_context !== undefined && {
+              action_context: data.action_context,
+            }),
           };
           if (Object.keys(goalFields).length > 0) {
             updateGoal(data.goalId, goalFields);
           }
-          logger.info({ goalId: data.goalId, sourceGroup }, 'Goal updated via IPC');
+          logger.info(
+            { goalId: data.goalId, sourceGroup },
+            'Goal updated via IPC',
+          );
         } else {
-          logger.warn({ goalId: data.goalId, sourceGroup }, 'Unauthorized goal update attempt');
+          logger.warn(
+            { goalId: data.goalId, sourceGroup },
+            'Unauthorized goal update attempt',
+          );
         }
       }
       break;

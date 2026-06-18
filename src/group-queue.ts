@@ -185,7 +185,7 @@ export class GroupQueue {
       state.pendingMessages = true;
       return false;
     }
-    state.idleWaiting = false;     // Agent is about to receive work, no longer idle
+    state.idleWaiting = false; // Agent is about to receive work, no longer idle
     state.pendingMessages = false; // Clear stale flag — message is being delivered now
 
     const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');

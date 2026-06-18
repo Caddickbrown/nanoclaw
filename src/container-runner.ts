@@ -68,7 +68,10 @@ function copyIfNewer(src: string, dst: string): void {
     if (srcStat.isDirectory()) {
       copyIfNewer(srcPath, dstPath);
     } else {
-      if (!fs.existsSync(dstPath) || srcStat.mtimeMs > fs.statSync(dstPath).mtimeMs) {
+      if (
+        !fs.existsSync(dstPath) ||
+        srcStat.mtimeMs > fs.statSync(dstPath).mtimeMs
+      ) {
         fs.copyFileSync(srcPath, dstPath);
         const srcStat2 = fs.statSync(srcPath);
         fs.utimesSync(dstPath, srcStat2.atime, srcStat2.mtime);
@@ -715,7 +718,6 @@ export function writeTasksSnapshot(
   const tasksFile = path.join(groupIpcDir, 'current_tasks.json');
   fs.writeFileSync(tasksFile, JSON.stringify(filteredTasks, null, 2));
 }
-
 
 export function writeRateLimitsSnapshot(
   groupFolder: string,

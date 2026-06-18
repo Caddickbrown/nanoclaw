@@ -60,7 +60,12 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound, stripInternalTags } from './router.js';
+import {
+  findChannel,
+  formatMessages,
+  formatOutbound,
+  stripInternalTags,
+} from './router.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
@@ -502,7 +507,9 @@ async function startMessageLoop(): Promise<void> {
             );
             // Only advance to the last non-bot message timestamp — bot message
             // timestamps can be newer than queued user messages and would skip them.
-            const lastNonBotMsg = messagesToSend.filter((m) => !m.is_bot_message).at(-1);
+            const lastNonBotMsg = messagesToSend
+              .filter((m) => !m.is_bot_message)
+              .at(-1);
             if (lastNonBotMsg) {
               lastAgentTimestamp[chatJid] = lastNonBotMsg.timestamp;
               saveState();
@@ -592,10 +599,7 @@ Decision:
 Adjust schedule if needed: mcp__nanoclaw__reschedule_self
 Be concise. Only message when there's genuine value.`;
 
-function ensureHeartbeatTask(
-  mainJid: string,
-  mainFolder: string,
-): void {
+function ensureHeartbeatTask(mainJid: string, mainFolder: string): void {
   const schedule = '30 8 * * *';
   let nextRun: string | undefined;
   try {
@@ -941,7 +945,9 @@ async function main(): Promise<void> {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       if (!channel.sendMessageWithButtons)
-        throw new Error(`Channel for ${jid} does not support sendMessageWithButtons`);
+        throw new Error(
+          `Channel for ${jid} does not support sendMessageWithButtons`,
+        );
       return channel.sendMessageWithButtons(jid, text, buttons, checkinId);
     },
     registeredGroups: () => registeredGroups,
